@@ -1,0 +1,19 @@
+GIMP Palette
+Name: Alquimia VGA
+Columns: 5
+#
+  0   0 170	1 azul
+  0 170   0	2 verde
+  0 170 170	3 celeste
+170   0   0	4 rojo
+170   0 170	5 morado
+170  85   0	6 cafe
+170 170 170	7 gris claro
+ 85  85  85	8 gris oscuro
+ 85  85 255	9 azul claro
+ 85 255  85	10 verde claro
+ 85 255 255	11 celeste claro
+255  85  85	12 rojo claro
+255  85 255	13 rosado
+255 255  85	14 amarillo
+255 255 255	15 blanco

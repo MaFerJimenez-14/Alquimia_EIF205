@@ -1,0 +1,11 @@
+# Icono acierto parcial - burbuja
+map o 11
+map w 15
+..oooo..
+.owwwwo.
+ow.wwwwo
+ow..wwwo
+.owwwwo.
+..oooo..
+........
+........
