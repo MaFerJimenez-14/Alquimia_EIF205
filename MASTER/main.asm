@@ -1011,8 +1011,8 @@ DrawTryCounter PROC
     call FillRect
 
     mov  al, triesUsed
-    cmp  al, numTries
-    jae  TC_Show                ; game over: do not count past the limit
+    cmp  gameState, STATE_PLAYING
+    jne  TC_Show                ; game over: show the attempts really used
     inc  al                     ; the attempt being played now
 TC_Show:
     mov  cl, 15
@@ -1032,7 +1032,6 @@ TC_Show:
     pop  ax
     ret
 DrawTryCounter ENDP
-
 ;------------------------------------------------------------------------------
 ; DrawPanel - zone C: potions in play, attempt counter, mascot
 ; Receives : numColors, triesUsed, numTries
@@ -1457,9 +1456,15 @@ PG_NotEnter:
     call ClearSlot
     jmp  PG_Loop
 PG_NotBack:
+    cmp  al, 's'
+    je   PG_Secret
+    cmp  al, 'S'
+    je   PG_Secret              ; S = use the row as secret (test mode)
     call TypeColor              ; ignores keys that are not colors
     jmp  PG_Loop
-
+PG_Secret:
+    call SetManualSecret
+    jmp  PG_Loop
 PG_Extended:
     cmp  ah, SC_LEFT
     jne  PG_NotLeft
