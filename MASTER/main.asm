@@ -6,6 +6,10 @@
 ;          2a - Text drawn straight into video memory with the BIOS font
 ;          2b - Game screen: the four zones of the mockup, drawn from data
 ;          3c - Playable: keyboard, random secret, bulls/cows, win/lose
+;          4  - Title screen, menu, levels, instructions, credits and
+;               animations timed with the BIOS tick counter
+;          4b - Easy level with its 12 attempts: rows of 14 px instead
+;               of 16, so 12 rows fill the same 168 px of zone B
 ;
 ; Screen zones (from the assignment):
 ;   A. Header     (0,0)     320x20   title and level
@@ -16,8 +20,8 @@
 ; Keys while playing:
 ;   <- ->  move between slots      UP/DOWN  change potion in the slot
 ;   1..N   put potion N            BACKSPACE clear the slot
-;   ENTER  evaluate the row        F2  use the row as secret (test mode)
-;   ESC    quit
+;   ENTER  evaluate the row        S/F2  use the row as secret (test)
+;   ESC    back to the menu
 ;==============================================================================
 
 .MODEL SMALL
@@ -37,7 +41,9 @@ VGA_STATUS      EQU 3DAh        ; input status port, bit 3 = vertical retrace
 MAX_POS         EQU 5           ; hardest level: 5 positions
 MAX_COLOR       EQU 8           ; hardest level: 8 colors
 MAX_TRIES       EQU 12          ; easiest level: 12 attempts
-ROWS_SHOWN      EQU 10          ; rows that fit on the board (zone B)
+ROW_LIMIT_16    EQU 10          ; up to 10 attempts fit with 16 px rows
+CURSOR_H        EQU 18          ; height of the selection frame sprite
+STATUS_Y        EQU 190         ; first line of zone D
 
 POTION_W        EQU 16          ; every potion sprite is 16x16
 POTION_H        EQU 16
@@ -51,6 +57,26 @@ SC_DOWN         EQU 50h
 SC_LEFT         EQU 4Bh
 SC_RIGHT        EQU 4Dh
 SC_F2           EQU 3Ch
+
+; ---- BIOS tick counter (~18.2 ticks per second) ----
+TICKS_SEG       EQU 0040h       ; BIOS data area
+TICKS_OFF       EQU 006Ch       ; low word of ticks since midnight
+ANIM_TICKS      EQU 4           ; frame change every 4 ticks (~0.22 s)
+
+; ---- What WaitKeyAnimated animates (bit flags) ----
+ANIM_MASCOT     EQU 1           ; the cauldron at mascotX, mascotY
+ANIM_CURSOR     EQU 2           ; the selection frame on the board
+
+; ---- PlayGame / EndGame results ----
+RESULT_MENU     EQU 0
+RESULT_AGAIN    EQU 1
+RESULT_QUIT     EQU 2
+
+; ---- Menu lists ----
+MENU_ITEMS      EQU 5
+LEVEL_ITEMS     EQU 3
+LIST_W          EQU 160         ; width of the highlight bar
+SEL_COLOR       EQU 1           ; highlight bar color
 
 ; ---- Game states ----
 STATE_PLAYING   EQU 0
@@ -66,8 +92,10 @@ BOARD_X         EQU 4
 BOARD_Y         EQU 22
 BOARD_W         EQU 196
 BOARD_H         EQU 168
-BOARD_Y0        EQU 26          ; y of the first row
-ROW_H           EQU 16          ; one row per attempt
+BOARD_Y0        EQU 26          ; y of the first row with 16 px rows
+BOARD_Y0_EASY   EQU 23          ; y of the first row with 14 px rows
+ROW_H           EQU 16          ; normal row height
+ROW_H_EASY      EQU 14          ; 12 rows * 14 px = 168 px = zone B
 ROWNUM_X        EQU 8           ; "01".."10"
 SLOT_X0         EQU 30          ; x of the first potion slot
 SLOT_STEP       EQU 20          ; 16 px potion + 4 px gap
@@ -153,12 +181,31 @@ numPos          db 4            ; positions per code
 numColors       db 6            ; potions in play
 allowRepeat     db 1            ; 0 = the secret never repeats a color
 numTries        db 10           ; attempts allowed
+rowH            db ROW_H        ; row height of this level (16 or 14)
+rowY0           dw BOARD_Y0     ; y of the first row of this level
 
 ; ---- Game state ----
 gameState       db STATE_PLAYING
 triesUsed       db 0            ; attempts already evaluated
 cursorPos       db 0            ; active slot in the row being built
 statusDirty     db 0            ; 1 = a warning is covering the key help
+lastStatusMsg   dw 0            ; what the status bar shows right now,
+lastStatusColor db 0            ; so it can be repainted (RepaintStatus)
+
+; ---- Animation state ----
+animFlags       db 0            ; ANIM_MASCOT / ANIM_CURSOR bits
+mascotFrame     db 0            ; 0 or 1: which frame is on screen
+mascotX         dw 0            ; where the animated cauldron is
+mascotY         dw 0
+lastTick        dw 0            ; tick count of the last frame change
+
+; ---- Menus ----
+menuSel         db 0            ; last option chosen in the main menu
+listTable       dw 0            ; SelectFromList parameters
+listCount       db 0
+listSel         db 0
+listX           dw 0
+listY           dw 0
 
 secretCode      db MAX_POS dup(0)   ; the code to discover
 guessCode       db MAX_POS dup(0)   ; row being built; 0 = slot empty
@@ -185,13 +232,76 @@ txtHelp6        db '<> POSICION  1-6 COLOR  ENTER EVALUAR', 0
 txtHelp8        db '<> POSICION  1-8 COLOR  ENTER EVALUAR', 0
 txtIncomplete   db 'INTENTO INCOMPLETO: LLENA TODAS', 0
 txtManual       db 'SECRETO FIJADO A MANO (PRUEBA)', 0
-txtEndHelp      db 'ENTER: JUGAR DE NUEVO   ESC: SALIR', 0
+txtEndHelp      db 'ENTER: OTRA   M: MENU   ESC: SALIR', 0
 txtFichas       db 'FICHAS', 0
 txtTry          db 'INTENTO', 0
 txtBoil         db 'HIRVIENDO', 0
 txtWon          db 'GANASTE!', 0
 txtLost         db 'PERDISTE', 0
 txtSecret       db 'SECRETO:', 0
+
+; ---- Author: write your name here (no accents, capital letters) ----
+txtAuthorName   db 'MARIA JIMENEZ', 0
+
+; ---- Title screen ----
+txtBigTitle     db 'MASTERMIND', 0
+txtSubtitle     db 'ALQUIMIA', 0
+txtTagline      db 'LA RECETA SECRETA TE ESPERA', 0
+txtCourse       db 'PROYECTO DE ARQUITECTURA DE COMPUTADORES', 0
+txtBy           db 'POR:', 0
+txtPressKey     db 'PRESIONA UNA TECLA PARA CONTINUAR', 0
+
+; ---- Main menu ----
+txtOptPlay      db 'JUGAR', 0
+txtOptLevel     db 'NIVEL DE DIFICULTAD', 0
+txtOptHelp      db 'INSTRUCCIONES', 0
+txtOptCredits   db 'CREDITOS', 0
+txtOptQuit      db 'SALIR', 0
+menuTable       dw OFFSET txtOptPlay, OFFSET txtOptLevel, OFFSET txtOptHelp
+                dw OFFSET txtOptCredits, OFFSET txtOptQuit
+txtMenuHelp     db 'FLECHAS MUEVEN   ENTER SELECCIONA', 0
+
+; ---- Level screen ----
+txtLevelTitle   db 'NIVEL DE DIFICULTAD', 0
+txtOptEasy      db 'FACIL', 0
+txtOptNormal    db 'NORMAL', 0
+txtOptHard      db 'DIFICIL', 0
+levelOptTable   dw OFFSET txtOptEasy, OFFSET txtOptNormal, OFFSET txtOptHard
+txtLvlInfo0     db 'FACIL  : 4 POS, 6 POCIONES, SIN REPETIR', 0
+txtLvlInfo1     db 'NORMAL : 4 POS, 6 POCIONES, REPITEN', 0
+txtLvlInfo2     db 'DIFICIL: 5 POS, 8 POCIONES, REPITEN', 0
+txtLvlInfo3     db 'INTENTOS: 12 / 10 / 10', 0
+txtLevelHelp    db 'ENTER ELIGE   ESC VUELVE', 0
+
+; ---- Instructions screen ----
+txtHelpTitle    db 'INSTRUCCIONES', 0
+txtHelp1        db 'DESCUBRE LA RECETA SECRETA: QUE POCION', 0
+txtHelp2        db 'VA EN CADA LUGAR, ANTES DE AGOTAR LOS', 0
+txtHelp3        db 'INTENTOS. TRAS CADA INTENTO VERAS:', 0
+txtHelpBull     db 'POCION CORRECTA EN SU LUGAR', 0
+txtHelpCow      db 'POCION CORRECTA, OTRO LUGAR', 0
+txtHelpExample  db 'EJEMPLO:', 0
+txtHelpRecipe   db 'RECETA', 0
+txtHelpGuess    db 'INTENTO', 0
+txtHelpOne      db '1', 0
+txtHelpTwo      db '2', 0
+txtHelpKeys1    db '<> MUEVE   ^v O NUMERO ELIGE POCION', 0
+txtHelpKeys2    db 'ENTER PRUEBA  BKSP BORRA  ESC MENU', 0
+txtHelpKeys3    db 'S: FIJAR SECRETO A MANO (PRUEBA)', 0
+txtBackKey      db 'PRESIONA UNA TECLA PARA VOLVER', 0
+; Example shown in the instructions: recipe 1234, attempt 1325
+helpRecipe      db 1, 2, 3, 4
+helpGuess       db 1, 3, 2, 5
+
+; ---- Credits screen ----
+txtCreditsTitle db 'CREDITOS', 0
+txtAuthorLbl    db 'AUTOR:', 0
+txtCred1        db 'EIF205 ARQUITECTURA DE COMPUTADORES', 0
+txtCred2        db 'UNIVERSIDAD NACIONAL - SEDE BRUNCA', 0
+txtCred3        db 'II CICLO 2026', 0
+txtCred4        db 'PROFESOR:', 0
+txtCred6        db 'GABRIEL NUNEZ M.', 0
+txtCred7        db 'SPRITES ORIGINALES  -  TASM 3.2', 0
 
 ; ---- Sprite tables, generated by herramientas/sprite2db.py ----
 INCLUDE frasco1.inc             ; round potion
@@ -227,13 +337,37 @@ main PROC
     call InitFont               ; find the BIOS letter shapes once
     call InitRandom             ; seed once, so every game differs
 
-M_Game:
-    call NewGame
-    call PlayGame               ; AL = 1 play again, 0 quit
-    cmp  al, 1
-    je   M_Game
+    call TitleScreen            ; RF-01
 
-    call RestoreVideoMode
+M_Menu:
+    call MenuScreen             ; AL = option chosen
+    cmp  al, 0
+    je   M_Play
+    cmp  al, 1
+    jne  M_NotLevel
+    call LevelScreen
+    jmp  M_Menu
+M_NotLevel:
+    cmp  al, 2
+    jne  M_NotHelp
+    call InstructionsScreen
+    jmp  M_Menu
+M_NotHelp:
+    cmp  al, 3
+    jne  M_Quit                 ; option 4 = SALIR
+    call CreditsScreen
+    jmp  M_Menu
+
+M_Play:
+    call NewGame
+    call PlayGame               ; AL = RESULT_MENU / AGAIN / QUIT
+    cmp  al, RESULT_AGAIN
+    je   M_Play
+    cmp  al, RESULT_QUIT
+    jne  M_Menu
+
+M_Quit:
+    call RestoreVideoMode       ; RF-14: leave DOS as we found it
     call ExitToDos
 main ENDP
 
@@ -708,6 +842,8 @@ ShowStatus PROC
     mov  dx, 191
     call DrawText
     mov  statusDirty, 1
+    mov  lastStatusMsg, si      ; remember it for RepaintStatus
+    mov  lastStatusColor, cl
 
     pop  di
     pop  si
@@ -740,6 +876,29 @@ DH_Show:
 DrawHelp ENDP
 
 ;------------------------------------------------------------------------------
+; RepaintStatus - draw the status bar again with its current message
+; Receives : lastStatusMsg, lastStatusColor
+; Returns  : nothing (statusDirty keeps its value)
+; Destroys : nothing
+; Notes    : with 14 px rows the last row and its cursor reach 2-3 px
+;            into zone D; repainting the bar keeps zone D clean
+;------------------------------------------------------------------------------
+RepaintStatus PROC
+    push ax
+    push cx
+    push si
+    mov  al, statusDirty        ; ShowStatus sets it to 1, keep the real one
+    mov  si, lastStatusMsg
+    mov  cl, lastStatusColor
+    call ShowStatus
+    mov  statusDirty, al
+    pop  si
+    pop  cx
+    pop  ax
+    ret
+RepaintStatus ENDP
+
+;------------------------------------------------------------------------------
 ; RestoreHelp - put the key help back if a warning is showing
 ; Receives : statusDirty
 ; Returns  : nothing
@@ -760,8 +919,8 @@ RestoreHelp ENDP
 ;------------------------------------------------------------------------------
 ; DrawBoardRow - one row of zone B: number, potions or empty slots,
 ;                and bulls/cows if the row was already evaluated
-; Receives : AL = row index 0..ROWS_SHOWN-1
-;            triesUsed, numPos, history, historyBulls, historyCows,
+; Receives : AL = row index 0..numTries-1
+;            rowH, rowY0, triesUsed, numPos, history, historyBulls, historyCows,
 ;            guessCode
 ; Returns  : nothing
 ; Destroys : nothing
@@ -777,10 +936,9 @@ DrawBoardRow PROC
     xor  ah, ah
     mov  di, ax                 ; DI = row index, kept for the whole PROC
 
-    ; DX = y of this row = BOARD_Y0 + row*16
-    mov  cl, 4
-    shl  ax, cl                 ; row * ROW_H (16 = 2^4)
-    add  ax, BOARD_Y0
+    ; DX = y of this row = rowY0 + row*rowH  (16 or 14 by level)
+    mul  rowH                   ; AX = AL * rowH
+    add  ax, rowY0
     mov  dx, ax
 
     ; Row number "01".."10" on the left
@@ -874,12 +1032,12 @@ DrawBoardRow ENDP
 
 ;------------------------------------------------------------------------------
 ; RefreshRow - redraw one board row and its neighbors, nothing else
-; Receives : AL = row index 0..ROWS_SHOWN-1
+; Receives : AL = row index 0..numTries-1
 ; Returns  : nothing
 ; Destroys : nothing
 ; Notes    : RG-08, only what changes is redrawn. The 18x18 cursor frame
-;            sticks out 1 px above and below its row, so the wiped strip
-;            is 18 px tall and the rows above and below are redrawn too.
+;            sticks out of its row, so the wiped strip is as tall as the
+;            frame and the rows above and below are redrawn too.
 ;------------------------------------------------------------------------------
 RefreshRow PROC
     push ax
@@ -890,19 +1048,21 @@ RefreshRow PROC
 
     call WaitRetrace            ; draw while the beam is off screen
 
-    ; Wipe the strip: from 1 px above the row to 1 px below it
+    ; Wipe the strip covered by the cursor: from 1 px above the row,
+    ; CURSOR_H px tall
     push ax
     xor  ah, ah
-    mov  dl, ROW_H
-    mul  dl                     ; AX = row * 16
-    add  ax, BOARD_Y0 - 1
-    mov  dx, ax
+    mul  rowH                   ; AX = row * rowH
+    add  ax, rowY0
+    dec  ax
+    mov  dx, ax                 ; DX = top of the strip
     mov  bx, BOARD_X + 1        ; inside the board frame
     mov  si, BOARD_W - 2
-    mov  di, ROW_H + 2
+    mov  di, CURSOR_H
     mov  al, BG_COLOR
     call FillRect
     pop  ax
+    push dx                     ; checked at the end
 
     ; Previous row (its bottom line was wiped)
     cmp  al, 0
@@ -912,12 +1072,21 @@ RefreshRow PROC
     inc  al
 RR_Self:
     call DrawBoardRow
-    ; Next row (its top line was wiped)
+    ; Next row (its top lines were wiped)
     inc  al
-    cmp  al, ROWS_SHOWN
-    jae  RR_Done
+    cmp  al, numTries
+    jae  RR_Status
     call DrawBoardRow
 
+RR_Status:
+    pop  dx                     ; top of the strip
+    ; Near the bottom, the strip or the next row's potions (16 px tall
+    ; on a rowH step) may reach zone D: repaint the bar in that case
+    mov  ax, STATUS_Y - CURSOR_H
+    sub  al, rowH               ; AX = last strip top that stays clear
+    cmp  dx, ax
+    jbe  RR_Done
+    call RepaintStatus
 RR_Done:
     pop  di
     pop  si
@@ -962,9 +1131,6 @@ DrawBoard PROC
     mov  cl, 11
     call DrawText
 
-    ; ---- Zone D: status bar ----
-    call DrawHelp
-
     ; ---- Zone B: frame and rows ----
     mov  bx, BOARD_X
     mov  dx, BOARD_Y
@@ -977,8 +1143,11 @@ DrawBoard PROC
 DB_Row:
     call DrawBoardRow
     inc  al
-    cmp  al, ROWS_SHOWN
+    cmp  al, numTries
     jb   DB_Row
+
+    ; ---- Zone D: status bar, after the rows so it stays on top ----
+    call DrawHelp
 
     pop  di
     pop  si
@@ -1032,6 +1201,7 @@ TC_Show:
     pop  ax
     ret
 DrawTryCounter ENDP
+
 ;------------------------------------------------------------------------------
 ; DrawPanel - zone C: potions in play, attempt counter, mascot
 ; Receives : numColors, triesUsed, numTries
@@ -1117,7 +1287,8 @@ DrawPanel ENDP
 ; Receives : cursorPos, triesUsed
 ; Returns  : nothing
 ; Destroys : nothing
-; Notes    : the 18x18 frame starts 1 px up and left of the 16x16 slot
+; Notes    : the 18x18 frame starts 1 px up and left of the 16x16 slot;
+;            mascotFrame picks marco1 or marco2 (RG-05 animation)
 ;------------------------------------------------------------------------------
 DrawCursor PROC
     push ax
@@ -1131,13 +1302,18 @@ DrawCursor PROC
     mov  bx, ax                 ; BX = x of the frame
 
     mov  al, triesUsed
-    mov  dl, ROW_H
-    mul  dl                     ; AX = row * ROW_H
-    add  ax, BOARD_Y0 - 1
+    mul  rowH                   ; AX = row * rowH
+    add  ax, rowY0
+    dec  ax
     mov  dx, ax                 ; DX = y of the frame
 
+    cmp  mascotFrame, 0         ; same clock as the mascot:
+    jne  CU_Frame2              ; the frame blinks yellow / white
     DRAW_SPRITE bx, dx, marco1_W, marco1_H, marco1
-
+    jmp  CU_Done
+CU_Frame2:
+    DRAW_SPRITE bx, dx, marco2_W, marco2_H, marco2
+CU_Done:
     pop  dx
     pop  bx
     pop  ax
@@ -1339,7 +1515,7 @@ EvaluateGuess ENDP
 ;------------------------------------------------------------------------------
 ; LoadLevel - copy the levelIdx row of levelTable into the level variables
 ; Receives : levelIdx
-; Returns  : numPos, numColors, allowRepeat, numTries
+; Returns  : numPos, numColors, allowRepeat, numTries, rowH, rowY0
 ; Destroys : nothing
 ;------------------------------------------------------------------------------
 LoadLevel PROC
@@ -1356,11 +1532,17 @@ LoadLevel PROC
     mov  al, levelTable[bx+2]   ; column 2: repeat allowed?
     mov  allowRepeat, al
     mov  al, levelTable[bx+3]   ; column 3: attempts
-    cmp  al, ROWS_SHOWN
-    jbe  LL_Tries
-    mov  al, ROWS_SHOWN         ; PENDING: the board shows 10 rows only
-LL_Tries:
     mov  numTries, al
+
+    ; Zone B is 168 px tall: 10 rows of 16 px, or 12 rows of 14 px.
+    ; Every attempt stays visible at the same time (RF-09).
+    mov  rowH, ROW_H
+    mov  rowY0, BOARD_Y0
+    cmp  al, ROW_LIMIT_16
+    jbe  LL_Done
+    mov  rowH, ROW_H_EASY
+    mov  rowY0, BOARD_Y0_EASY
+LL_Done:
     pop  bx
     pop  ax
     ret
@@ -1403,6 +1585,12 @@ NewGame PROC
     mov  gameState, STATE_PLAYING
     mov  statusDirty, 0
 
+    ; While playing, the panel cauldron and the cursor are animated
+    mov  animFlags, ANIM_MASCOT OR ANIM_CURSOR
+    mov  mascotFrame, 0
+    mov  mascotX, 252
+    mov  mascotY, 136
+
     call GenerateSecret
 
     call DrawBoard
@@ -1419,26 +1607,27 @@ NewGame ENDP
 ;------------------------------------------------------------------------------
 ; PlayGame - read keys and dispatch them until the game ends or ESC
 ; Receives : a game prepared by NewGame
-; Returns  : AL = 1 to play again, AL = 0 to quit
+; Returns  : AL = RESULT_MENU, RESULT_AGAIN or RESULT_QUIT
 ; Destroys : AH
 ; Notes    : extended keys (arrows, F2) arrive with AL = 0 or E0h and
 ;            their identity in the scan code AH; normal keys in AL.
+;            Keys are read through WaitKeyAnimated, so the cauldron
+;            and the cursor keep moving while the player thinks.
 ;------------------------------------------------------------------------------
 PlayGame PROC
 PG_Loop:
     cmp  gameState, STATE_PLAYING
     je   PG_Read
-    call EndGame                ; AL = 1 again / 0 quit
+    call EndGame                ; AL = AGAIN / MENU / QUIT
     jmp  PG_Exit
 
 PG_Read:
-    mov  ah, 00h
-    int  16h                    ; AL = ASCII, AH = scan code
+    call WaitKeyAnimated        ; AL = ASCII, AH = scan code
     call RestoreHelp            ; any warning disappears on a new key
 
     cmp  al, KEY_ESC
     jne  PG_NotEsc
-    xor  al, al                 ; quit
+    mov  al, RESULT_MENU        ; ESC during a game: back to the menu
     jmp  PG_Exit
 PG_NotEsc:
     cmp  al, 0
@@ -1465,6 +1654,7 @@ PG_NotBack:
 PG_Secret:
     call SetManualSecret
     jmp  PG_Loop
+
 PG_Extended:
     cmp  ah, SC_LEFT
     jne  PG_NotLeft
@@ -1774,7 +1964,7 @@ SetManualSecret ENDP
 ;------------------------------------------------------------------------------
 ; EndGame - show the result, reveal the secret, ask what to do next
 ; Receives : gameState (WON or LOST), secretCode, numPos
-; Returns  : AL = 1 play again (ENTER), AL = 0 quit (ESC)
+; Returns  : AL = RESULT_AGAIN (ENTER), RESULT_MENU (M), RESULT_QUIT (ESC)
 ; Destroys : AH
 ;------------------------------------------------------------------------------
 EndGame PROC
@@ -1783,6 +1973,8 @@ EndGame PROC
     push dx
     push si
     push di
+
+    mov  animFlags, 0           ; the mascot area is about to be reused
 
     ; Replace the mascot area of the panel with the result
     mov  bx, PANEL_X + 2
@@ -1824,11 +2016,17 @@ EGm_Wait:
     cmp  al, KEY_ENTER
     je   EGm_Again
     cmp  al, KEY_ESC
-    jne  EGm_Wait               ; only ENTER or ESC mean something here
-    xor  al, al
+    je   EGm_Quit
+    or   al, 20h                ; lowercase, so 'M' and 'm' both work
+    cmp  al, 'm'
+    jne  EGm_Wait               ; only ENTER, M or ESC mean something
+    mov  al, RESULT_MENU
+    jmp  EGm_Done
+EGm_Quit:
+    mov  al, RESULT_QUIT
     jmp  EGm_Done
 EGm_Again:
-    mov  al, 1
+    mov  al, RESULT_AGAIN
 EGm_Done:
     pop  di
     pop  si
@@ -1837,6 +2035,546 @@ EGm_Done:
     pop  bx
     ret
 EndGame ENDP
+
+;==============================================================================
+;                         ANIMATION AND MENUS
+;==============================================================================
+
+;------------------------------------------------------------------------------
+; GetTicks - read the BIOS tick counter
+; Receives : nothing
+; Returns  : AX = low word of ticks since midnight (0040h:006Ch)
+; Destroys : nothing
+; Notes    : the timer chip bumps this word ~18.2 times per second, on
+;            any CPU, so animations timed with it run at the same speed
+;            on a slow or a fast machine (RG-06)
+;------------------------------------------------------------------------------
+GetTicks PROC
+    push bx
+    push es
+    mov  ax, TICKS_SEG
+    mov  es, ax                 ; ES -> BIOS data area
+    mov  bx, TICKS_OFF
+    mov  ax, es:[bx]
+    pop  es
+    pop  bx
+    ret
+GetTicks ENDP
+
+;------------------------------------------------------------------------------
+; DrawMascot - draw the current frame of the cauldron
+; Receives : mascotX, mascotY, mascotFrame
+; Returns  : nothing
+; Destroys : nothing
+; Notes    : the two frames differ (bubbles, flames), so the old one is
+;            wiped first; WaitRetrace hides the wipe from the eye
+;------------------------------------------------------------------------------
+DrawMascot PROC
+    push ax
+    push bx
+    push dx
+    push si
+    push di
+
+    call WaitRetrace
+    mov  bx, mascotX
+    mov  dx, mascotY
+    mov  si, caldero1_W
+    mov  di, caldero1_H
+    mov  al, BG_COLOR
+    call FillRect               ; erase the previous frame
+
+    cmp  mascotFrame, 0
+    jne  DM_Frame2
+    DRAW_SPRITE bx, dx, caldero1_W, caldero1_H, caldero1
+    jmp  DM_Done
+DM_Frame2:
+    DRAW_SPRITE bx, dx, caldero2_W, caldero2_H, caldero2
+DM_Done:
+    pop  di
+    pop  si
+    pop  dx
+    pop  bx
+    pop  ax
+    ret
+DrawMascot ENDP
+
+;------------------------------------------------------------------------------
+; WaitKeyAnimated - wait for a key while the animations keep running
+; Receives : animFlags (what to animate), mascotX/Y
+; Returns  : AL = ASCII, AH = scan code of the key pressed
+; Destroys : nothing else
+; Notes    : INT 16h AH=01h only PEEKS (ZF=1: no key), so the loop never
+;            blocks. Every ANIM_TICKS ticks the frame flips and the
+;            animated elements are redrawn. The subtraction works even
+;            when the 16-bit counter wraps around.
+;------------------------------------------------------------------------------
+WaitKeyAnimated PROC
+    push cx
+
+    call GetTicks
+    mov  lastTick, ax
+
+WK_Loop:
+    mov  ah, 01h
+    int  16h                    ; is a key waiting? (does not remove it)
+    jnz  WK_Key
+
+    call GetTicks
+    mov  cx, ax
+    sub  ax, lastTick           ; ticks since the last frame
+    cmp  ax, ANIM_TICKS
+    jb   WK_Loop                ; too soon: keep waiting
+
+    mov  lastTick, cx
+    xor  mascotFrame, 1         ; 0 <-> 1
+    test animFlags, ANIM_MASCOT
+    jz   WK_NoMascot
+    call DrawMascot
+WK_NoMascot:
+    test animFlags, ANIM_CURSOR
+    jz   WK_Loop
+    call DrawCursor
+    jmp  WK_Loop
+
+WK_Key:
+    mov  ah, 00h
+    int  16h                    ; now take the key out of the buffer
+
+    pop  cx
+    ret
+WaitKeyAnimated ENDP
+
+;------------------------------------------------------------------------------
+; DrawHeaderBar - zone A style bar with a title
+; Receives : SI = offset of the title
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+DrawHeaderBar PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    push si                     ; FillRect uses SI as width
+    xor  bx, bx
+    xor  dx, dx
+    mov  si, SCREEN_W
+    mov  di, 20
+    mov  al, BAR_COLOR
+    call FillRect
+    pop  si
+
+    mov  bx, 8
+    mov  dx, 6
+    mov  cl, 14
+    call DrawText
+
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+DrawHeaderBar ENDP
+
+;------------------------------------------------------------------------------
+; DrawPotionRow - the 8 potions in a row, as decoration
+; Receives : DX = y
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+DrawPotionRow PROC
+    push ax
+    push bx
+    push cx
+    mov  bx, 40
+    mov  al, 1                  ; color numbers 1..8
+    mov  cx, MAX_COLOR
+PR_Next:
+    call DrawPotion
+    add  bx, 30
+    inc  al
+    loop PR_Next
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+DrawPotionRow ENDP
+
+;------------------------------------------------------------------------------
+; DrawList - draw a vertical list of options, highlighting one
+; Receives : listTable, listCount, listSel, listX, listY
+; Returns  : nothing
+; Destroys : nothing
+; Notes    : the highlighted option gets a colored bar and yellow text;
+;            the others are drawn on the background so an old
+;            highlight disappears (only the list area is redrawn)
+;------------------------------------------------------------------------------
+DrawList PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    call WaitRetrace
+    mov  si, listTable          ; SI -> table of string offsets
+    mov  dx, listY
+    xor  ch, ch                 ; CH = item index (CL is the text color)
+
+DL_Item:
+    ; Bar behind the item: highlight color or background
+    mov  bx, listX
+    sub  bx, 4
+    push dx
+    sub  dx, 4
+    push si
+    mov  si, LIST_W
+    mov  di, 16
+    mov  al, BG_COLOR
+    cmp  ch, listSel
+    jne  DL_Bar
+    mov  al, SEL_COLOR
+DL_Bar:
+    call FillRect
+    pop  si
+    pop  dx
+
+    ; Item text
+    mov  cl, FRAME_COLOR
+    cmp  ch, listSel
+    jne  DL_Text
+    mov  cl, 14                 ; selected: yellow
+DL_Text:
+    push si
+    mov  bx, listX
+    mov  si, [si]               ; SI = offset of this item's string
+    call DrawText
+    pop  si
+
+    add  si, 2                  ; next entry of the table
+    add  dx, 16                 ; next line
+    inc  ch
+    cmp  ch, listCount
+    jb   DL_Item
+
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+DrawList ENDP
+
+;------------------------------------------------------------------------------
+; SelectFromList - let the player pick an option with the arrows
+; Receives : SI = table of string offsets, CL = number of options,
+;            AL = option highlighted at start, BX = x, DX = y of option 0
+; Returns  : AL = chosen option; CF = 0 with ENTER, CF = 1 with ESC
+; Destroys : AH
+; Notes    : one routine for every menu, the lists are just data
+;------------------------------------------------------------------------------
+SelectFromList PROC
+    mov  listTable, si
+    mov  listCount, cl
+    mov  listSel, al
+    mov  listX, bx
+    mov  listY, dx
+    call DrawList
+
+SL_Key:
+    call WaitKeyAnimated
+    cmp  al, KEY_ENTER
+    je   SL_Enter
+    cmp  al, KEY_ESC
+    je   SL_Esc
+    cmp  ah, SC_UP
+    je   SL_Up
+    cmp  ah, SC_DOWN
+    jne  SL_Key                 ; any other key: ignore it
+
+    mov  al, listSel            ; DOWN: next option, wrap to the first
+    inc  al
+    cmp  al, listCount
+    jb   SL_Set
+    xor  al, al
+    jmp  SL_Set
+SL_Up:
+    mov  al, listSel            ; UP: previous option, wrap to the last
+    cmp  al, 0
+    jne  SL_Dec
+    mov  al, listCount
+SL_Dec:
+    dec  al
+SL_Set:
+    mov  listSel, al
+    call DrawList               ; only the list is redrawn
+    jmp  SL_Key
+
+SL_Enter:
+    mov  al, listSel
+    clc
+    ret
+SL_Esc:
+    mov  al, listSel
+    stc
+    ret
+SelectFromList ENDP
+
+;------------------------------------------------------------------------------
+; TitleScreen - RF-01: name, theme, author, animated mascot, wait a key
+; Receives : nothing
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+TitleScreen PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov  al, BG_COLOR
+    call ClearScreen
+    mov  si, OFFSET txtBigTitle
+    call DrawHeaderBar
+
+    DRAW_TEXT 128,  28, 13, txtSubtitle
+    mov  dx, 44
+    call DrawPotionRow
+    DRAW_TEXT  52, 108, 10, txtTagline
+    DRAW_TEXT   0, 128, FRAME_COLOR, txtCourse
+    DRAW_TEXT  76, 144, FRAME_COLOR, txtBy
+    DRAW_TEXT 116, 144, 15, txtAuthorName
+
+    mov  si, OFFSET txtPressKey
+    mov  cl, HELP_COLOR
+    call ShowStatus
+
+    mov  animFlags, ANIM_MASCOT ; the cauldron bubbles until a key
+    mov  mascotFrame, 0
+    mov  mascotX, 152
+    mov  mascotY, 80
+    call DrawMascot
+    call WaitKeyAnimated
+
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+TitleScreen ENDP
+
+;------------------------------------------------------------------------------
+; MenuScreen - RF-02: main menu
+; Receives : menuSel (option highlighted at start)
+; Returns  : AL = 0 play, 1 level, 2 instructions, 3 credits, 4 quit
+; Destroys : AH
+;------------------------------------------------------------------------------
+MenuScreen PROC
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov  al, BG_COLOR
+    call ClearScreen
+    mov  si, OFFSET txtTitle
+    call DrawHeaderBar
+    mov  dx, 156
+    call DrawPotionRow
+    mov  si, OFFSET txtMenuHelp
+    mov  cl, HELP_COLOR
+    call ShowStatus
+
+    mov  animFlags, ANIM_MASCOT
+    mov  mascotFrame, 0
+    mov  mascotX, 152
+    mov  mascotY, 28
+    call DrawMascot
+
+MN_Ask:
+    mov  si, OFFSET menuTable
+    mov  cl, MENU_ITEMS
+    mov  al, menuSel
+    mov  bx, 84
+    mov  dx, 60
+    call SelectFromList
+    jc   MN_Ask                 ; ESC in the main menu does nothing
+    mov  menuSel, al            ; remembered for the next visit
+
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    ret
+MenuScreen ENDP
+
+;------------------------------------------------------------------------------
+; LevelScreen - choose Facil / Normal / Dificil
+; Receives : levelIdx (highlighted at start)
+; Returns  : levelIdx changed with ENTER, unchanged with ESC
+; Destroys : nothing
+;------------------------------------------------------------------------------
+LevelScreen PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov  al, BG_COLOR
+    call ClearScreen
+    mov  si, OFFSET txtLevelTitle
+    call DrawHeaderBar
+    DRAW_TEXT 8, 116, FRAME_COLOR, txtLvlInfo0
+    DRAW_TEXT 8, 128, FRAME_COLOR, txtLvlInfo1
+    DRAW_TEXT 8, 140, FRAME_COLOR, txtLvlInfo2
+    DRAW_TEXT 8, 156, 15, txtLvlInfo3
+    mov  si, OFFSET txtLevelHelp
+    mov  cl, HELP_COLOR
+    call ShowStatus
+
+    mov  animFlags, 0           ; nothing animated on this screen
+    mov  si, OFFSET levelOptTable
+    mov  cl, LEVEL_ITEMS
+    mov  al, levelIdx
+    mov  bx, 84
+    mov  dx, 44
+    call SelectFromList
+    jc   LV_Done                ; ESC: keep the old level
+    mov  levelIdx, al
+LV_Done:
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+LevelScreen ENDP
+
+;------------------------------------------------------------------------------
+; InstructionsScreen - RF-03: rules explained with the game's own sprites
+; Receives : nothing
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+InstructionsScreen PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov  al, BG_COLOR
+    call ClearScreen
+    mov  si, OFFSET txtHelpTitle
+    call DrawHeaderBar
+
+    DRAW_TEXT 8, 26, 15, txtHelp1
+    DRAW_TEXT 8, 36, 15, txtHelp2
+    DRAW_TEXT 8, 46, 15, txtHelp3
+
+    ; What each icon means, shown with the real icons
+    DRAW_SPRITE 8, 62, chispa_W, chispa_H, chispa
+    DRAW_TEXT  24, 62, 14, txtHelpBull
+    DRAW_SPRITE 8, 76, burbuja_W, burbuja_H, burbuja
+    DRAW_TEXT  24, 76, 11, txtHelpCow
+
+    ; Worked example: recipe 1234, attempt 1325 -> 1 bull, 2 cows
+    DRAW_TEXT 8, 92, FRAME_COLOR, txtHelpExample
+    DRAW_TEXT 8, 108, FRAME_COLOR, txtHelpRecipe
+    DRAW_TEXT 8, 128, FRAME_COLOR, txtHelpGuess
+    xor  si, si
+    mov  bx, 80
+IN_Potion:
+    mov  dx, 104
+    mov  al, helpRecipe[si]
+    call DrawPotion
+    mov  dx, 124
+    mov  al, helpGuess[si]
+    call DrawPotion
+    add  bx, SLOT_STEP
+    inc  si
+    cmp  si, 4
+    jb   IN_Potion
+    DRAW_SPRITE 170, 128, chispa_W, chispa_H, chispa
+    DRAW_TEXT   180, 128, 14, txtHelpOne
+    DRAW_SPRITE 194, 128, burbuja_W, burbuja_H, burbuja
+    DRAW_TEXT   204, 128, 11, txtHelpTwo
+
+    DRAW_TEXT 8, 148, 10, txtHelpKeys1
+    DRAW_TEXT 8, 160, 10, txtHelpKeys2
+    DRAW_TEXT 8, 172, 10, txtHelpKeys3
+
+    mov  si, OFFSET txtBackKey
+    mov  cl, HELP_COLOR
+    call ShowStatus
+    mov  animFlags, 0
+    call WaitKeyAnimated
+
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+InstructionsScreen ENDP
+
+;------------------------------------------------------------------------------
+; CreditsScreen - author, course and teachers
+; Receives : nothing
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+CreditsScreen PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov  al, BG_COLOR
+    call ClearScreen
+    mov  si, OFFSET txtCreditsTitle
+    call DrawHeaderBar
+
+    DRAW_TEXT  76,  40, 14, txtTitle
+    DRAW_TEXT  40,  60, FRAME_COLOR, txtAuthorLbl
+    DRAW_TEXT  96,  60, 15, txtAuthorName
+    DRAW_TEXT  20,  84, FRAME_COLOR, txtCred1
+    DRAW_TEXT  24,  96, FRAME_COLOR, txtCred2
+    DRAW_TEXT 108, 108, FRAME_COLOR, txtCred3
+    DRAW_TEXT  40, 128, FRAME_COLOR, txtCred4
+    DRAW_TEXT  56, 140, 15, txtCred6
+    DRAW_TEXT  36, 170, 10, txtCred7
+
+    mov  si, OFFSET txtBackKey
+    mov  cl, HELP_COLOR
+    call ShowStatus
+
+    mov  animFlags, ANIM_MASCOT
+    mov  mascotFrame, 0
+    mov  mascotX, 280
+    mov  mascotY, 36
+    call DrawMascot
+    call WaitKeyAnimated
+
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+CreditsScreen ENDP
 
 ;------------------------------------------------------------------------------
 ; ExitToDos - terminate the program with return code 0
