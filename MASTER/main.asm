@@ -5,12 +5,19 @@
 ;          1b - Theme sprites (potions, icons, frame, cauldron)
 ;          2a - Text drawn straight into video memory with the BIOS font
 ;          2b - Game screen: the four zones of the mockup, drawn from data
+;          3c - Playable: keyboard, random secret, bulls/cows, win/lose
 ;
 ; Screen zones (from the assignment):
 ;   A. Header     (0,0)     320x20   title and level
 ;   B. Board      (4,22)    196x168  history: one 16 px row per attempt
 ;   C. Side panel (204,22)  112x168  potions, attempt counter, mascot
 ;   D. Status bar (0,190)   320x10   key help and messages
+;
+; Keys while playing:
+;   <- ->  move between slots      UP/DOWN  change potion in the slot
+;   1..N   put potion N            BACKSPACE clear the slot
+;   ENTER  evaluate the row        F2  use the row as secret (test mode)
+;   ESC    quit
 ;==============================================================================
 
 .MODEL SMALL
@@ -25,13 +32,34 @@ SCREEN_W        EQU 320
 SCREEN_WORDS    EQU 32000       ; 64000 bytes / 2, for REP STOSW
 CHAR_W          EQU 8           ; BIOS font cell: 8x8 pixels
 CHAR_H          EQU 8
+VGA_STATUS      EQU 3DAh        ; input status port, bit 3 = vertical retrace
 
 MAX_POS         EQU 5           ; hardest level: 5 positions
+MAX_COLOR       EQU 8           ; hardest level: 8 colors
 MAX_TRIES       EQU 12          ; easiest level: 12 attempts
 ROWS_SHOWN      EQU 10          ; rows that fit on the board (zone B)
 
 POTION_W        EQU 16          ; every potion sprite is 16x16
 POTION_H        EQU 16
+
+; ---- Keys: ASCII codes and scan codes of extended keys ----
+KEY_ESC         EQU 1Bh
+KEY_ENTER       EQU 0Dh
+KEY_BACK        EQU 08h
+SC_UP           EQU 48h
+SC_DOWN         EQU 50h
+SC_LEFT         EQU 4Bh
+SC_RIGHT        EQU 4Dh
+SC_F2           EQU 3Ch
+
+; ---- Game states ----
+STATE_PLAYING   EQU 0
+STATE_WON       EQU 1
+STATE_LOST      EQU 2
+
+; ---- Pseudo-random generator: seed = seed * LCG_A + LCG_C ----
+LCG_A           EQU 25173
+LCG_C           EQU 13849
 
 ; ---- Zone B layout ----
 BOARD_X         EQU 4
@@ -60,6 +88,8 @@ BG_COLOR        EQU 0           ; black screen background
 BAR_COLOR       EQU 1           ; header and status bar fill
 FRAME_COLOR     EQU 7           ; zone borders
 EMPTY_COLOR     EQU 8           ; empty slot boxes
+HELP_COLOR      EQU 7           ; normal status bar text
+WARN_COLOR      EQU 14          ; status bar warnings
 
 ;------------------------------------------------------------------------------
 ; MACRO DRAW_SPRITE
@@ -104,38 +134,46 @@ DRAW_TEXT MACRO px, py, pcolor, pmsg
     pop  bx
 ENDM
 
-;------------------------------------------------------------------------------
-; MACRO WAIT_KEY - block until any key is pressed, discard it
-;------------------------------------------------------------------------------
-WAIT_KEY MACRO
-    push ax
-    mov  ah, 00h
-    int  16h                    ; BIOS keyboard: wait and read key
-    pop  ax
-ENDM
-
 .DATA
 oldVideoMode    db ?            ; mode active before we switched to 13h
 targetSeg       dw VIDEO_SEG    ; where drawing goes
 fontSeg         dw ?            ; BIOS 8x8 font address (set by InitFont)
 fontOff         dw ?
+seed            dw 0            ; state of the pseudo-random generator
 
-; ---- Game state (demo values until the keyboard phase) ----
+; ---- Level table: positions, colors, repeat allowed, attempts ----
+; One row per level, 4 bytes each, so row = level * 4
+levelTable      db 4, 6, 0, 12          ; 0 Facil
+                db 4, 6, 1, 10          ; 1 Normal
+                db 5, 8, 1, 10          ; 2 Dificil
+
+; ---- Current level (loaded from levelTable by LoadLevel) ----
 levelIdx        db 1            ; 0 easy, 1 normal, 2 hard
 numPos          db 4            ; positions per code
 numColors       db 6            ; potions in play
+allowRepeat     db 1            ; 0 = the secret never repeats a color
 numTries        db 10           ; attempts allowed
-triesUsed       db 2            ; attempts already evaluated
-cursorPos       db 1            ; active slot in the row being built
 
-; History: row r, position p is history[r*MAX_POS + p]; 0 = empty
-history         db 1,3,5,6,0
-                db 2,2,4,6,0
-                db (MAX_TRIES-2)*MAX_POS dup(0)
-historyBulls    db 1,0, (MAX_TRIES-2) dup(0)
-historyCows     db 2,1, (MAX_TRIES-2) dup(0)
-currentGuess    db 4,0,0,0,0    ; row being built; 0 = slot not chosen yet
+; ---- Game state ----
+gameState       db STATE_PLAYING
+triesUsed       db 0            ; attempts already evaluated
+cursorPos       db 0            ; active slot in the row being built
+statusDirty     db 0            ; 1 = a warning is covering the key help
+
+secretCode      db MAX_POS dup(0)   ; the code to discover
+guessCode       db MAX_POS dup(0)   ; row being built; 0 = slot empty
 emptyCode       db MAX_POS dup(0)   ; used for rows not reached yet
+
+; History: row r, position p is history[r*MAX_POS + p]
+history         db MAX_TRIES*MAX_POS dup(0)
+historyBulls    db MAX_TRIES dup(0)
+historyCows     db MAX_TRIES dup(0)
+
+; One counter per color for EvaluateGuess. Index = color, 0 unused.
+countSecret     db MAX_COLOR+1 dup(0)
+countGuess      db MAX_COLOR+1 dup(0)
+bulls           db 0            ; right color, right position
+cows            db 0            ; right color, wrong position
 
 ; ---- Texts (0-terminated, no accents: the font only has ASCII) ----
 txtTitle        db 'MASTERMIND - ALQUIMIA', 0
@@ -143,10 +181,17 @@ txtLvl0         db 'NIVEL: FACIL', 0
 txtLvl1         db 'NIVEL: NORMAL', 0
 txtLvl2         db 'NIVEL: DIFICIL', 0
 levelNameTable  dw OFFSET txtLvl0, OFFSET txtLvl1, OFFSET txtLvl2
-txtStatus       db '<> POSICION  1-6 COLOR  ENTER EVALUAR', 0
+txtHelp6        db '<> POSICION  1-6 COLOR  ENTER EVALUAR', 0
+txtHelp8        db '<> POSICION  1-8 COLOR  ENTER EVALUAR', 0
+txtIncomplete   db 'INTENTO INCOMPLETO: LLENA TODAS', 0
+txtManual       db 'SECRETO FIJADO A MANO (PRUEBA)', 0
+txtEndHelp      db 'ENTER: JUGAR DE NUEVO   ESC: SALIR', 0
 txtFichas       db 'FICHAS', 0
 txtTry          db 'INTENTO', 0
 txtBoil         db 'HIRVIENDO', 0
+txtWon          db 'GANASTE!', 0
+txtLost         db 'PERDISTE', 0
+txtSecret       db 'SECRETO:', 0
 
 ; ---- Sprite tables, generated by herramientas/sprite2db.py ----
 INCLUDE frasco1.inc             ; round potion
@@ -171,7 +216,7 @@ potionTable     dw OFFSET frasco1, OFFSET frasco2, OFFSET frasco3
 
 .CODE
 ;==============================================================================
-; main - draw the game screen from the state variables
+; main - one game after another until the player quits
 ;==============================================================================
 main PROC
     mov  ax, @data
@@ -180,16 +225,21 @@ main PROC
     call SaveVideoMode
     call SetMode13h
     call InitFont               ; find the BIOS letter shapes once
+    call InitRandom             ; seed once, so every game differs
 
-    call DrawBoard              ; zones A, B, D and the 10 rows
-    call DrawPanel              ; zone C
-    call DrawCursor             ; frame around the active slot
-
-    WAIT_KEY
+M_Game:
+    call NewGame
+    call PlayGame               ; AL = 1 play again, 0 quit
+    cmp  al, 1
+    je   M_Game
 
     call RestoreVideoMode
     call ExitToDos
 main ENDP
+
+;==============================================================================
+;                         VIDEO MODE AND BASIC DRAWING
+;==============================================================================
 
 ;------------------------------------------------------------------------------
 ; SaveVideoMode
@@ -236,6 +286,32 @@ RestoreVideoMode PROC
     pop  ax
     ret
 RestoreVideoMode ENDP
+
+;------------------------------------------------------------------------------
+; WaitRetrace - wait for the start of the vertical retrace
+; Receives : nothing
+; Returns  : nothing
+; Destroys : nothing
+; Notes    : drawing right after the beam leaves the screen avoids tearing
+;            and flicker (RG-08). First wait for any retrace in progress
+;            to end, then for the next one to begin.
+;------------------------------------------------------------------------------
+WaitRetrace PROC
+    push ax
+    push dx
+    mov  dx, VGA_STATUS
+WR_InRetrace:
+    in   al, dx
+    test al, 08h
+    jnz  WR_InRetrace           ; still inside the previous retrace
+WR_NoRetrace:
+    in   al, dx
+    test al, 08h
+    jz   WR_NoRetrace           ; beam still drawing the screen
+    pop  dx
+    pop  ax
+    ret
+WaitRetrace ENDP
 
 ;------------------------------------------------------------------------------
 ; ClearScreen - fill the whole target surface with one color
@@ -450,6 +526,10 @@ DrawPotion PROC
     ret
 DrawPotion ENDP
 
+;==============================================================================
+;                                   TEXT
+;==============================================================================
+
 ;------------------------------------------------------------------------------
 ; InitFont - remember where the BIOS keeps its 8x8 letter shapes
 ; Receives : nothing
@@ -603,11 +683,86 @@ DrawNumber2 PROC
 DrawNumber2 ENDP
 
 ;------------------------------------------------------------------------------
+; ShowStatus - replace the status bar (zone D) with a message
+; Receives : SI = offset of the message, CL = text color
+; Returns  : statusDirty = 1, so the next key restores the help
+; Destroys : nothing
+;------------------------------------------------------------------------------
+ShowStatus PROC
+    push ax
+    push bx
+    push dx
+    push si
+    push di
+
+    push si                     ; FillRect uses SI as width
+    xor  bx, bx
+    mov  dx, 190
+    mov  si, SCREEN_W
+    mov  di, 10
+    mov  al, BAR_COLOR
+    call FillRect               ; wipe the old text
+    pop  si
+
+    mov  bx, 4
+    mov  dx, 191
+    call DrawText
+    mov  statusDirty, 1
+
+    pop  di
+    pop  si
+    pop  dx
+    pop  bx
+    pop  ax
+    ret
+ShowStatus ENDP
+
+;------------------------------------------------------------------------------
+; DrawHelp - status bar with the key help of the current level
+; Receives : numColors
+; Returns  : statusDirty = 0
+; Destroys : nothing
+;------------------------------------------------------------------------------
+DrawHelp PROC
+    push cx
+    push si
+    mov  si, OFFSET txtHelp6
+    cmp  numColors, 8
+    jne  DH_Show
+    mov  si, OFFSET txtHelp8    ; hard level: keys 1-8
+DH_Show:
+    mov  cl, HELP_COLOR
+    call ShowStatus
+    mov  statusDirty, 0         ; this IS the normal content
+    pop  si
+    pop  cx
+    ret
+DrawHelp ENDP
+
+;------------------------------------------------------------------------------
+; RestoreHelp - put the key help back if a warning is showing
+; Receives : statusDirty
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+RestoreHelp PROC
+    cmp  statusDirty, 0
+    je   RH_Done                ; help already visible: nothing to redraw
+    call DrawHelp
+RH_Done:
+    ret
+RestoreHelp ENDP
+
+;==============================================================================
+;                              GAME SCREEN
+;==============================================================================
+
+;------------------------------------------------------------------------------
 ; DrawBoardRow - one row of zone B: number, potions or empty slots,
 ;                and bulls/cows if the row was already evaluated
 ; Receives : AL = row index 0..ROWS_SHOWN-1
 ;            triesUsed, numPos, history, historyBulls, historyCows,
-;            currentGuess
+;            guessCode
 ; Returns  : nothing
 ; Destroys : nothing
 ;------------------------------------------------------------------------------
@@ -646,7 +801,7 @@ DrawBoardRow PROC
     mov  si, OFFSET emptyCode   ; future row: nothing chosen yet
     jmp  BR_Slots
 BR_FromCurrent:
-    mov  si, OFFSET currentGuess ; the row being built right now
+    mov  si, OFFSET guessCode   ; the row being built right now
     jmp  BR_Slots
 BR_FromHistory:
     push dx
@@ -718,6 +873,61 @@ BR_Done:
 DrawBoardRow ENDP
 
 ;------------------------------------------------------------------------------
+; RefreshRow - redraw one board row and its neighbors, nothing else
+; Receives : AL = row index 0..ROWS_SHOWN-1
+; Returns  : nothing
+; Destroys : nothing
+; Notes    : RG-08, only what changes is redrawn. The 18x18 cursor frame
+;            sticks out 1 px above and below its row, so the wiped strip
+;            is 18 px tall and the rows above and below are redrawn too.
+;------------------------------------------------------------------------------
+RefreshRow PROC
+    push ax
+    push bx
+    push dx
+    push si
+    push di
+
+    call WaitRetrace            ; draw while the beam is off screen
+
+    ; Wipe the strip: from 1 px above the row to 1 px below it
+    push ax
+    xor  ah, ah
+    mov  dl, ROW_H
+    mul  dl                     ; AX = row * 16
+    add  ax, BOARD_Y0 - 1
+    mov  dx, ax
+    mov  bx, BOARD_X + 1        ; inside the board frame
+    mov  si, BOARD_W - 2
+    mov  di, ROW_H + 2
+    mov  al, BG_COLOR
+    call FillRect
+    pop  ax
+
+    ; Previous row (its bottom line was wiped)
+    cmp  al, 0
+    je   RR_Self
+    dec  al
+    call DrawBoardRow
+    inc  al
+RR_Self:
+    call DrawBoardRow
+    ; Next row (its top line was wiped)
+    inc  al
+    cmp  al, ROWS_SHOWN
+    jae  RR_Done
+    call DrawBoardRow
+
+RR_Done:
+    pop  di
+    pop  si
+    pop  dx
+    pop  bx
+    pop  ax
+    ret
+RefreshRow ENDP
+
+;------------------------------------------------------------------------------
 ; DrawBoard - background, header (A), status bar (D) and board (B)
 ; Receives : levelIdx and everything DrawBoardRow needs
 ; Returns  : nothing
@@ -753,13 +963,7 @@ DrawBoard PROC
     call DrawText
 
     ; ---- Zone D: status bar ----
-    xor  bx, bx
-    mov  dx, 190
-    mov  si, SCREEN_W
-    mov  di, 10
-    mov  al, BAR_COLOR
-    call FillRect
-    DRAW_TEXT 4, 191, FRAME_COLOR, txtStatus
+    call DrawHelp
 
     ; ---- Zone B: frame and rows ----
     mov  bx, BOARD_X
@@ -784,6 +988,50 @@ DB_Row:
     pop  ax
     ret
 DrawBoard ENDP
+
+;------------------------------------------------------------------------------
+; DrawTryCounter - "INTENTO 03/10" in the panel
+; Receives : triesUsed, numTries
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+DrawTryCounter PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    mov  bx, 272                ; wipe the old digits first
+    mov  dx, 112
+    mov  si, 40
+    mov  di, CHAR_H
+    mov  al, BG_COLOR
+    call FillRect
+
+    mov  al, triesUsed
+    cmp  al, numTries
+    jae  TC_Show                ; game over: do not count past the limit
+    inc  al                     ; the attempt being played now
+TC_Show:
+    mov  cl, 15
+    call DrawNumber2
+    mov  al, '/'
+    mov  bx, 288
+    call DrawChar
+    mov  al, numTries
+    mov  bx, 296
+    call DrawNumber2
+
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+DrawTryCounter ENDP
 
 ;------------------------------------------------------------------------------
 ; DrawPanel - zone C: potions in play, attempt counter, mascot
@@ -848,20 +1096,9 @@ DP_Next:
     cmp  si, ax
     jb   DP_Next
 
-    ; ---- Attempt counter: INTENTO 03/10 ----
+    ; ---- Attempt counter ----
     DRAW_TEXT 212, 112, FRAME_COLOR, txtTry
-    mov  al, triesUsed
-    inc  al                     ; the attempt being played now
-    mov  bx, 272
-    mov  dx, 112
-    mov  cl, 15
-    call DrawNumber2
-    mov  al, '/'
-    mov  bx, 288
-    call DrawChar
-    mov  al, numTries
-    mov  bx, 296
-    call DrawNumber2
+    call DrawTryCounter
 
     ; ---- Mascot ----
     DRAW_SPRITE 252, 136, caldero1_W, caldero1_H, caldero1
@@ -907,6 +1144,694 @@ DrawCursor PROC
     pop  ax
     ret
 DrawCursor ENDP
+
+;------------------------------------------------------------------------------
+; RedrawCurrent - refresh the row being built and its cursor
+; Receives : triesUsed, cursorPos, guessCode
+; Returns  : nothing
+; Destroys : nothing
+;------------------------------------------------------------------------------
+RedrawCurrent PROC
+    push ax
+    mov  al, triesUsed
+    call RefreshRow
+    call DrawCursor
+    pop  ax
+    ret
+RedrawCurrent ENDP
+
+;==============================================================================
+;                          RANDOM SECRET AND RULES
+;==============================================================================
+
+;------------------------------------------------------------------------------
+; InitRandom - seed the generator with the BIOS tick counter (RF-04)
+; Receives : nothing
+; Returns  : seed = low word of ticks since midnight
+; Destroys : nothing
+; Notes    : the tick counter advances ~18.2 times per second, so the
+;            seed depends on the exact moment the program starts
+;------------------------------------------------------------------------------
+InitRandom PROC
+    push ax
+    push cx
+    push dx
+    mov  ah, 00h
+    int  1Ah                    ; CX:DX = ticks since midnight
+    mov  seed, dx               ; the fast-changing low word
+    pop  dx
+    pop  cx
+    pop  ax
+    ret
+InitRandom ENDP
+
+;------------------------------------------------------------------------------
+; NextRandom - next pseudo-random color
+; Receives : seed, numColors
+; Returns  : AL = random color 1..numColors; seed updated
+; Destroys : AH
+;------------------------------------------------------------------------------
+NextRandom PROC
+    push bx
+    push dx
+
+    mov  ax, seed
+    mov  bx, LCG_A
+    mul  bx                     ; DX:AX = seed * A (we keep only AX)
+    add  ax, LCG_C
+    mov  seed, ax               ; new state
+
+    ; The high byte of an LCG is more random than the low byte,
+    ; whose lowest bit just alternates 0,1,0,1...
+    mov  al, ah
+    xor  ah, ah                 ; AX = 0..255
+    mov  bl, numColors
+    div  bl                     ; AH = AX mod numColors (0..numColors-1)
+    mov  al, ah
+    inc  al                     ; shift to color range 1..numColors
+
+    pop  dx
+    pop  bx
+    ret
+NextRandom ENDP
+
+;------------------------------------------------------------------------------
+; GenerateSecret - fill secretCode with random colors for the level
+; Receives : numPos, numColors, allowRepeat
+; Returns  : secretCode filled
+; Destroys : nothing
+; Notes    : with allowRepeat = 0 a color already used is drawn again,
+;            so the easy level never repeats colors (RF-05)
+;------------------------------------------------------------------------------
+GenerateSecret PROC
+    push ax
+    push bx
+    push cx
+    push si
+
+    xor  si, si                 ; SI = position being filled
+GS_NextPos:
+    call NextRandom             ; AL = candidate color
+    cmp  allowRepeat, 0
+    jne  GS_Store               ; repeats allowed: take it as is
+
+    ; Look for AL in the positions already filled (0 .. SI-1)
+    xor  bx, bx
+GS_Check:
+    cmp  bx, si
+    je   GS_Store               ; checked all previous: AL is new
+    cmp  secretCode[bx], al
+    je   GS_NextPos             ; already used: draw another color
+    inc  bx
+    jmp  GS_Check
+
+GS_Store:
+    mov  secretCode[si], al
+    inc  si
+    mov  cl, numPos
+    xor  ch, ch
+    cmp  si, cx
+    jb   GS_NextPos             ; more positions to fill
+
+    pop  si
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+GenerateSecret ENDP
+
+;------------------------------------------------------------------------------
+; EvaluateGuess - count bulls and cows of guessCode against secretCode
+; Receives : secretCode, guessCode, numPos
+; Returns  : bulls, cows
+; Destroys : nothing
+;
+; Algorithm (each secret piece may count only once):
+;   Pass 1, for every position i:
+;     if secret[i] == guess[i]  -> one more bull
+;     else                      -> countSecret[secret[i]]++ and
+;                                  countGuess[guess[i]]++
+;   Pass 2, for every color c:
+;     cows += min(countSecret[c], countGuess[c])
+;------------------------------------------------------------------------------
+EvaluateGuess PROC
+    push ax
+    push bx
+    push cx
+    push si
+
+    ; Counters must start at zero on every evaluation
+    xor  bx, bx
+    mov  cx, MAX_COLOR+1
+EG_Clear:
+    mov  countSecret[bx], 0
+    mov  countGuess[bx], 0
+    inc  bx
+    loop EG_Clear
+    mov  bulls, 0
+    mov  cows, 0
+
+    ; ---- Pass 1: bulls, and count the colors that were not bulls ----
+    xor  si, si                 ; SI = position index
+    xor  ch, ch
+    mov  cl, numPos
+EG_Pass1:
+    mov  al, secretCode[si]     ; AL = secret color at this position
+    mov  ah, guessCode[si]      ; AH = guessed color at this position
+    cmp  al, ah
+    jne  EG_NotBull
+    inc  bulls                  ; same color, same place
+    jmp  EG_Next1
+EG_NotBull:
+    xor  bh, bh
+    mov  bl, al
+    inc  countSecret[bx]        ; secret still has one unmatched 'AL'
+    mov  bl, ah
+    inc  countGuess[bx]         ; guess still has one unmatched 'AH'
+EG_Next1:
+    inc  si
+    loop EG_Pass1
+
+    ; ---- Pass 2: cows = sum over colors of min(secret, guess) ----
+    mov  bx, 1                  ; colors go from 1 to MAX_COLOR
+    mov  cx, MAX_COLOR
+EG_Pass2:
+    mov  al, countSecret[bx]
+    mov  ah, countGuess[bx]
+    cmp  al, ah
+    jbe  EG_HaveMin             ; AL is already the smaller one
+    mov  al, ah                 ; otherwise the guess count is smaller
+EG_HaveMin:
+    add  cows, al
+    inc  bx
+    loop EG_Pass2
+
+    pop  si
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+EvaluateGuess ENDP
+
+;==============================================================================
+;                              GAME FLOW
+;==============================================================================
+
+;------------------------------------------------------------------------------
+; LoadLevel - copy the levelIdx row of levelTable into the level variables
+; Receives : levelIdx
+; Returns  : numPos, numColors, allowRepeat, numTries
+; Destroys : nothing
+;------------------------------------------------------------------------------
+LoadLevel PROC
+    push ax
+    push bx
+    mov  bl, levelIdx
+    xor  bh, bh
+    shl  bx, 1
+    shl  bx, 1                  ; BX = level * 4 (row of the table)
+    mov  al, levelTable[bx]     ; column 0: positions
+    mov  numPos, al
+    mov  al, levelTable[bx+1]   ; column 1: colors
+    mov  numColors, al
+    mov  al, levelTable[bx+2]   ; column 2: repeat allowed?
+    mov  allowRepeat, al
+    mov  al, levelTable[bx+3]   ; column 3: attempts
+    cmp  al, ROWS_SHOWN
+    jbe  LL_Tries
+    mov  al, ROWS_SHOWN         ; PENDING: the board shows 10 rows only
+LL_Tries:
+    mov  numTries, al
+    pop  bx
+    pop  ax
+    ret
+LoadLevel ENDP
+
+;------------------------------------------------------------------------------
+; NewGame - reset every table, pick a secret and draw the whole screen
+; Receives : levelIdx
+; Returns  : a fresh game ready to play
+; Destroys : nothing
+;------------------------------------------------------------------------------
+NewGame PROC
+    push ax
+    push cx
+    push di
+    push es
+
+    call LoadLevel
+
+    ; REP STOSB writes to ES:DI, so point ES at our own data
+    mov  ax, ds
+    mov  es, ax
+    cld
+    xor  al, al
+    mov  di, OFFSET history
+    mov  cx, MAX_TRIES*MAX_POS
+    rep  stosb                  ; no attempts in the history
+    mov  di, OFFSET historyBulls
+    mov  cx, MAX_TRIES
+    rep  stosb
+    mov  di, OFFSET historyCows
+    mov  cx, MAX_TRIES
+    rep  stosb
+    mov  di, OFFSET guessCode
+    mov  cx, MAX_POS
+    rep  stosb                  ; current row starts empty
+
+    mov  triesUsed, 0
+    mov  cursorPos, 0
+    mov  gameState, STATE_PLAYING
+    mov  statusDirty, 0
+
+    call GenerateSecret
+
+    call DrawBoard
+    call DrawPanel
+    call DrawCursor
+
+    pop  es
+    pop  di
+    pop  cx
+    pop  ax
+    ret
+NewGame ENDP
+
+;------------------------------------------------------------------------------
+; PlayGame - read keys and dispatch them until the game ends or ESC
+; Receives : a game prepared by NewGame
+; Returns  : AL = 1 to play again, AL = 0 to quit
+; Destroys : AH
+; Notes    : extended keys (arrows, F2) arrive with AL = 0 or E0h and
+;            their identity in the scan code AH; normal keys in AL.
+;------------------------------------------------------------------------------
+PlayGame PROC
+PG_Loop:
+    cmp  gameState, STATE_PLAYING
+    je   PG_Read
+    call EndGame                ; AL = 1 again / 0 quit
+    jmp  PG_Exit
+
+PG_Read:
+    mov  ah, 00h
+    int  16h                    ; AL = ASCII, AH = scan code
+    call RestoreHelp            ; any warning disappears on a new key
+
+    cmp  al, KEY_ESC
+    jne  PG_NotEsc
+    xor  al, al                 ; quit
+    jmp  PG_Exit
+PG_NotEsc:
+    cmp  al, 0
+    je   PG_Extended
+    cmp  al, 0E0h
+    je   PG_Extended
+
+    cmp  al, KEY_ENTER
+    jne  PG_NotEnter
+    call SubmitGuess
+    jmp  PG_Loop
+PG_NotEnter:
+    cmp  al, KEY_BACK
+    jne  PG_NotBack
+    call ClearSlot
+    jmp  PG_Loop
+PG_NotBack:
+    call TypeColor              ; ignores keys that are not colors
+    jmp  PG_Loop
+
+PG_Extended:
+    cmp  ah, SC_LEFT
+    jne  PG_NotLeft
+    call MoveLeft
+    jmp  PG_Loop
+PG_NotLeft:
+    cmp  ah, SC_RIGHT
+    jne  PG_NotRight
+    call MoveRight
+    jmp  PG_Loop
+PG_NotRight:
+    cmp  ah, SC_UP
+    jne  PG_NotUp
+    call ColorUp
+    jmp  PG_Loop
+PG_NotUp:
+    cmp  ah, SC_DOWN
+    jne  PG_NotDown
+    call ColorDown
+    jmp  PG_Loop
+PG_NotDown:
+    cmp  ah, SC_F2
+    jne  PG_Ignore
+    call SetManualSecret
+PG_Ignore:
+    jmp  PG_Loop                ; any other key does nothing
+
+PG_Exit:
+    ret
+PlayGame ENDP
+
+;------------------------------------------------------------------------------
+; MoveLeft / MoveRight - move the cursor one slot, stopping at the ends
+; Receives : cursorPos, numPos
+; Returns  : cursorPos updated and redrawn
+; Destroys : nothing
+;------------------------------------------------------------------------------
+MoveLeft PROC
+    cmp  cursorPos, 0
+    je   ML_Done                ; already on the first slot
+    dec  cursorPos
+    call RedrawCurrent
+ML_Done:
+    ret
+MoveLeft ENDP
+
+MoveRight PROC
+    push ax
+    mov  al, cursorPos
+    inc  al
+    cmp  al, numPos
+    jae  MR_Done                ; already on the last slot
+    mov  cursorPos, al
+    call RedrawCurrent
+MR_Done:
+    pop  ax
+    ret
+MoveRight ENDP
+
+;------------------------------------------------------------------------------
+; ColorUp / ColorDown - cycle the potion of the active slot
+; Receives : cursorPos, numColors, guessCode
+; Returns  : guessCode[cursorPos] updated and redrawn
+; Destroys : nothing
+; Notes    : up goes 1,2,..,N,1..  down goes N,..,2,1,N..
+;            an empty slot (0) starts at 1 going up and at N going down
+;------------------------------------------------------------------------------
+ColorUp PROC
+    push ax
+    push bx
+    mov  bl, cursorPos
+    xor  bh, bh
+    mov  al, guessCode[bx]
+    inc  al
+    cmp  al, numColors
+    jbe  CU_Store
+    mov  al, 1                  ; past the last potion: wrap to the first
+CU_Store:
+    mov  guessCode[bx], al
+    call RedrawCurrent
+    pop  bx
+    pop  ax
+    ret
+ColorUp ENDP
+
+ColorDown PROC
+    push ax
+    push bx
+    mov  bl, cursorPos
+    xor  bh, bh
+    mov  al, guessCode[bx]
+    cmp  al, 1
+    jbe  CD_Wrap                ; on 1 or empty: wrap to the last
+    dec  al
+    jmp  CD_Store
+CD_Wrap:
+    mov  al, numColors
+CD_Store:
+    mov  guessCode[bx], al
+    call RedrawCurrent
+    pop  bx
+    pop  ax
+    ret
+ColorDown ENDP
+
+;------------------------------------------------------------------------------
+; TypeColor - put potion N in the active slot when key N is pressed
+; Receives : AL = ASCII of the key, cursorPos, numColors, numPos
+; Returns  : slot filled and cursor moved one slot right (if possible)
+; Destroys : nothing
+; Notes    : any key outside '1'..numColors is ignored (robust keyboard)
+;------------------------------------------------------------------------------
+TypeColor PROC
+    push ax
+    push bx
+
+    sub  al, '0'                ; ASCII -> number ('1' -> 1)
+    cmp  al, 1
+    jb   TC_Ignore              ; below '1' (also wraps for other keys)
+    cmp  al, numColors
+    ja   TC_Ignore              ; beyond this level's potions
+
+    mov  bl, cursorPos
+    xor  bh, bh
+    mov  guessCode[bx], al
+
+    inc  bl                     ; move on, so a code can be typed in a row
+    cmp  bl, numPos
+    jae  TC_Redraw
+    mov  cursorPos, bl
+TC_Redraw:
+    call RedrawCurrent
+TC_Ignore:
+    pop  bx
+    pop  ax
+    ret
+TypeColor ENDP
+
+;------------------------------------------------------------------------------
+; ClearSlot - BACKSPACE: empty the active slot
+; Receives : cursorPos
+; Returns  : guessCode[cursorPos] = 0, redrawn
+; Destroys : nothing
+;------------------------------------------------------------------------------
+ClearSlot PROC
+    push bx
+    mov  bl, cursorPos
+    xor  bh, bh
+    mov  guessCode[bx], 0
+    call RedrawCurrent
+    pop  bx
+    ret
+ClearSlot ENDP
+
+;------------------------------------------------------------------------------
+; IsGuessComplete - check that every slot of the row has a potion
+; Receives : guessCode, numPos
+; Returns  : CF = 0 complete, CF = 1 some slot is empty
+; Destroys : nothing
+;------------------------------------------------------------------------------
+IsGuessComplete PROC
+    push bx
+    push cx
+    xor  bx, bx
+    xor  ch, ch
+    mov  cl, numPos
+GC_Check:
+    cmp  guessCode[bx], 0
+    je   GC_Empty
+    inc  bx
+    loop GC_Check
+    clc
+    jmp  GC_Done
+GC_Empty:
+    stc
+GC_Done:
+    pop  cx                     ; POP keeps the flags, CF reaches RET
+    pop  bx
+    ret
+IsGuessComplete ENDP
+
+;------------------------------------------------------------------------------
+; SubmitGuess - ENTER: evaluate the row, store it and check win/lose
+; Receives : guessCode, secretCode, triesUsed, numPos, numTries
+; Returns  : history updated, triesUsed+1, gameState maybe WON or LOST
+; Destroys : nothing
+; Notes    : an incomplete row shows a warning and costs no attempt (RF-07)
+;------------------------------------------------------------------------------
+SubmitGuess PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    call IsGuessComplete
+    jnc  SG_Complete
+    mov  si, OFFSET txtIncomplete
+    mov  cl, WARN_COLOR
+    call ShowStatus
+    jmp  SG_Done
+
+SG_Complete:
+    call EvaluateGuess          ; -> bulls, cows
+
+    ; Copy the row into history[triesUsed*MAX_POS ...] and empty it
+    mov  al, triesUsed
+    mov  dl, MAX_POS
+    mul  dl
+    mov  di, ax                 ; DI = first byte of this row in history
+    xor  bx, bx
+    mov  cx, MAX_POS
+SG_Copy:
+    mov  al, guessCode[bx]
+    mov  history[di], al
+    mov  guessCode[bx], 0       ; next row starts empty
+    inc  bx
+    inc  di
+    loop SG_Copy
+
+    mov  bl, triesUsed
+    xor  bh, bh
+    mov  al, bulls
+    mov  historyBulls[bx], al
+    mov  al, cows
+    mov  historyCows[bx], al
+
+    mov  si, bx                 ; SI = row just evaluated (to redraw)
+    inc  triesUsed
+    mov  cursorPos, 0
+
+    ; ---- Win: every position is a bull ----
+    mov  al, bulls
+    cmp  al, numPos
+    jne  SG_NotWon
+    mov  gameState, STATE_WON
+    jmp  SG_Redraw
+SG_NotWon:
+    ; ---- Lose: no attempts left ----
+    mov  al, triesUsed
+    cmp  al, numTries
+    jb   SG_Redraw
+    mov  gameState, STATE_LOST
+
+SG_Redraw:
+    mov  ax, si
+    call RefreshRow             ; the evaluated row and the next one
+    call DrawTryCounter
+    cmp  gameState, STATE_PLAYING
+    jne  SG_Done
+    call DrawCursor             ; cursor now on the new row
+
+SG_Done:
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+SubmitGuess ENDP
+
+;------------------------------------------------------------------------------
+; SetManualSecret - F2: the row being built becomes the secret
+; Receives : guessCode (complete)
+; Returns  : secretCode = guessCode, row emptied again
+; Destroys : nothing
+; Notes    : test mode required by the assignment to run Table 2 by hand
+;------------------------------------------------------------------------------
+SetManualSecret PROC
+    push ax
+    push bx
+    push cx
+    push si
+
+    call IsGuessComplete
+    jnc  MS_Copy
+    mov  si, OFFSET txtIncomplete
+    mov  cl, WARN_COLOR
+    call ShowStatus
+    jmp  MS_Done
+
+MS_Copy:
+    xor  bx, bx
+    mov  cx, MAX_POS
+MS_Next:
+    mov  al, guessCode[bx]
+    mov  secretCode[bx], al
+    mov  guessCode[bx], 0
+    inc  bx
+    loop MS_Next
+    mov  cursorPos, 0
+    call RedrawCurrent
+    mov  si, OFFSET txtManual
+    mov  cl, WARN_COLOR
+    call ShowStatus
+
+MS_Done:
+    pop  si
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+SetManualSecret ENDP
+
+;------------------------------------------------------------------------------
+; EndGame - show the result, reveal the secret, ask what to do next
+; Receives : gameState (WON or LOST), secretCode, numPos
+; Returns  : AL = 1 play again (ENTER), AL = 0 quit (ESC)
+; Destroys : AH
+;------------------------------------------------------------------------------
+EndGame PROC
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    ; Replace the mascot area of the panel with the result
+    mov  bx, PANEL_X + 2
+    mov  dx, 128
+    mov  si, PANEL_W - 4
+    mov  di, 60
+    mov  al, BG_COLOR
+    call FillRect
+
+    cmp  gameState, STATE_WON
+    jne  EGm_Lost
+    DRAW_TEXT 212, 132, 14, txtWon
+    jmp  EGm_Secret
+EGm_Lost:
+    DRAW_TEXT 212, 132, 12, txtLost
+
+EGm_Secret:
+    DRAW_TEXT 212, 146, FRAME_COLOR, txtSecret
+    xor  si, si                 ; SI = position of the secret
+    mov  bx, 212
+    mov  dx, 158
+EGm_Potion:
+    mov  al, secretCode[si]
+    call DrawPotion
+    add  bx, SLOT_STEP
+    inc  si
+    mov  al, numPos
+    xor  ah, ah
+    cmp  si, ax
+    jb   EGm_Potion
+
+    mov  si, OFFSET txtEndHelp
+    mov  cl, HELP_COLOR
+    call ShowStatus
+
+EGm_Wait:
+    mov  ah, 00h
+    int  16h
+    cmp  al, KEY_ENTER
+    je   EGm_Again
+    cmp  al, KEY_ESC
+    jne  EGm_Wait               ; only ENTER or ESC mean something here
+    xor  al, al
+    jmp  EGm_Done
+EGm_Again:
+    mov  al, 1
+EGm_Done:
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    ret
+EndGame ENDP
 
 ;------------------------------------------------------------------------------
 ; ExitToDos - terminate the program with return code 0
