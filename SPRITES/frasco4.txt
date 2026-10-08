@@ -2,8 +2,8 @@
 map O 8
 map C 6
 map G 11
-map L 12
-map D 4
+map L 24
+map D 25
 map W 15
 ......CCCC......
 ......CCCC......

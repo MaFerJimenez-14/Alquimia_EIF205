@@ -2,8 +2,8 @@
 map O 8
 map C 6
 map G 11
-map L 14
-map D 6
+map L 26
+map D 27
 map W 15
 ......CCCC......
 ......OGGO......

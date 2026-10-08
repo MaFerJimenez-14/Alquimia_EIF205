@@ -3,7 +3,7 @@ map O 8
 map C 6
 map G 11
 map L 14
-map D 2
+map D 31
 map W 15
 ......CCCC......
 ......CCCC......

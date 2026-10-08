@@ -10,6 +10,9 @@
 ;               animations timed with the BIOS tick counter
 ;          4b - Easy level with its 12 attempts: rows of 14 px instead
 ;               of 16, so 12 rows fill the same 168 px of zone B
+;          5  - Own palette: colors 16..31 programmed through the DAC
+;               ports 3C8h/3C9h (colors 0..15 keep the VGA defaults)
+;          6  - End-of-game screen with different win/lose animations
 ;
 ; Screen zones (from the assignment):
 ;   A. Header     (0,0)     320x20   title and level
@@ -66,6 +69,16 @@ ANIM_TICKS      EQU 4           ; frame change every 4 ticks (~0.22 s)
 ; ---- What WaitKeyAnimated animates (bit flags) ----
 ANIM_MASCOT     EQU 1           ; the cauldron at mascotX, mascotY
 ANIM_CURSOR     EQU 2           ; the selection frame on the board
+ANIM_END        EQU 4           ; win / lose animation of the end screen
+
+; ---- End screen layout ----
+END_LEFT_X      EQU 40          ; cauldron on the left
+END_RIGHT_X     EQU 264         ; cauldron on the right
+END_CY          EQU 148         ; y of both cauldrons
+END_BOX_W       EQU 48          ; area wiped around each cauldron
+END_BOX_H       EQU 48
+END_TITLE_X     EQU 128         ; "GANASTE!" / "PERDISTE" (8 chars, centered)
+END_TITLE_Y     EQU 40
 
 ; ---- PlayGame / EndGame results ----
 RESULT_MENU     EQU 0
@@ -76,7 +89,6 @@ RESULT_QUIT     EQU 2
 MENU_ITEMS      EQU 5
 LEVEL_ITEMS     EQU 3
 LIST_W          EQU 160         ; width of the highlight bar
-SEL_COLOR       EQU 1           ; highlight bar color
 
 ; ---- Game states ----
 STATE_PLAYING   EQU 0
@@ -111,13 +123,25 @@ PANEL_W         EQU 112
 PANEL_H         EQU 168
 PANEL_COLS      EQU 4           ; potions per row in the panel
 
-; ---- Colors (default VGA palette until our own palette exists) ----
-BG_COLOR        EQU 0           ; black screen background
-BAR_COLOR       EQU 1           ; header and status bar fill
-FRAME_COLOR     EQU 7           ; zone borders
-EMPTY_COLOR     EQU 8           ; empty slot boxes
-HELP_COLOR      EQU 7           ; normal status bar text
-WARN_COLOR      EQU 14          ; status bar warnings
+; ---- VGA DAC (color table of the video card) ----
+DAC_WRITE       EQU 3C8h        ; OUT here: first color index to change
+DAC_DATA        EQU 3C9h        ; OUT here: R, G, B (0..63) per color
+PAL_FIRST       EQU 16          ; our colors are 16..31; 0..15 untouched
+PAL_COUNT       EQU 16
+
+; ---- Colors of our own palette (see paletteTable) ----
+BG_COLOR        EQU 16          ; laboratory night purple background
+BAR_COLOR       EQU 17          ; header and status bar fill
+FRAME_COLOR     EQU 18          ; zone borders, secondary text
+EMPTY_COLOR     EQU 19          ; empty slot boxes
+SEL_COLOR       EQU 20          ; menu highlight bar
+TITLE_COLOR     EQU 21          ; gold: titles and selected option
+TEXT_COLOR      EQU 22          ; parchment: normal text
+ACCENT_COLOR    EQU 23          ; teal: level name
+WIN_COLOR       EQU 29          ; green: "GANASTE!"
+LOSE_COLOR      EQU 30          ; red: "PERDISTE"
+HELP_COLOR      EQU TEXT_COLOR  ; normal status bar text
+WARN_COLOR      EQU TITLE_COLOR ; status bar warnings
 
 ;------------------------------------------------------------------------------
 ; MACRO DRAW_SPRITE
@@ -168,6 +192,25 @@ targetSeg       dw VIDEO_SEG    ; where drawing goes
 fontSeg         dw ?            ; BIOS 8x8 font address (set by InitFont)
 fontOff         dw ?
 seed            dw 0            ; state of the pseudo-random generator
+
+; ---- Own palette (RG-07): R, G, B per color, each 0..63 ----
+; The VGA DAC uses 6 bits per channel, so 63 is full intensity.
+paletteTable    db  6,  3, 10   ; 16 background (night purple)
+                db 16,  8, 26   ; 17 header / status bar
+                db 36, 30, 46   ; 18 frames (lavender)
+                db 20, 15, 28   ; 19 empty slots
+                db 26, 12, 40   ; 20 menu highlight
+                db 63, 50, 16   ; 21 gold (titles)
+                db 58, 54, 46   ; 22 parchment (text)
+                db 22, 54, 50   ; 23 teal (accent)
+                db 63, 32, 40   ; 24 heart potion liquid (rose)
+                db 44, 14, 26   ; 25 heart potion shadow
+                db 58, 42,  6   ; 26 star potion liquid (amber)
+                db 38, 24,  2   ; 27 star potion shadow
+                db  8, 10, 36   ; 28 square potion shadow (navy)
+                db 12, 56, 24   ; 29 win green
+                db 60, 16, 16   ; 30 lose red
+                db 40, 40,  6   ; 31 tall potion shadow (olive)
 
 ; ---- Level table: positions, colors, repeat allowed, attempts ----
 ; One row per level, 4 bytes each, so row = level * 4
@@ -228,8 +271,8 @@ txtLvl0         db 'NIVEL: FACIL', 0
 txtLvl1         db 'NIVEL: NORMAL', 0
 txtLvl2         db 'NIVEL: DIFICIL', 0
 levelNameTable  dw OFFSET txtLvl0, OFFSET txtLvl1, OFFSET txtLvl2
-txtHelp6        db '<> POSICION  1-6 COLOR  ENTER EVALUAR', 0
-txtHelp8        db '<> POSICION  1-8 COLOR  ENTER EVALUAR', 0
+txtHelp6        db '<> POS 1-6 COLOR ENTER EVALUAR ESC MENU', 0
+txtHelp8        db '<> POS 1-8 COLOR ENTER EVALUAR ESC MENU', 0
 txtIncomplete   db 'INTENTO INCOMPLETO: LLENA TODAS', 0
 txtManual       db 'SECRETO FIJADO A MANO (PRUEBA)', 0
 txtEndHelp      db 'ENTER: OTRA   M: MENU   ESC: SALIR', 0
@@ -239,6 +282,16 @@ txtBoil         db 'HIRVIENDO', 0
 txtWon          db 'GANASTE!', 0
 txtLost         db 'PERDISTE', 0
 txtSecret       db 'SECRETO:', 0
+txtCodeLbl      db 'RECETA SECRETA', 0
+txtUsed         db 'INTENTOS USADOS: ', 0
+
+; ---- End animation: 3 (dx, dy) offsets from the cauldron per frame ----
+; Group = (lost ? 2 : 0) + frame; each group is 3 pairs of words = 12 bytes.
+; Win: gold sparks jump around the cauldron. Lose: grey bubbles of smoke.
+endOffsets      dw -14, -6,   18,-20,    2,-24  ; win,  frame 0
+                dw  20, -8,  -12,-22,  -14,  8  ; win,  frame 1
+                dw  -2,-10,    8,-18,   14, -8  ; lose, frame 0
+                dw   8,-12,    0,-22,   16,-20  ; lose, frame 1
 
 ; ---- Author: write your name here (no accents, capital letters) ----
 txtAuthorName   db 'MARIA JIMENEZ', 0
@@ -334,6 +387,7 @@ main PROC
 
     call SaveVideoMode
     call SetMode13h
+    call SetPalette             ; after the mode switch, which resets it
     call InitFont               ; find the BIOS letter shapes once
     call InitRandom             ; seed once, so every game differs
 
@@ -405,6 +459,43 @@ SetMode13h PROC
     pop  ax
     ret
 SetMode13h ENDP
+
+;------------------------------------------------------------------------------
+; SetPalette - program our own colors into the VGA DAC (RG-07)
+; Receives : paletteTable (PAL_COUNT colors x 3 bytes)
+; Returns  : colors PAL_FIRST .. PAL_FIRST+PAL_COUNT-1 redefined
+; Destroys : nothing
+; Notes    : one OUT to 3C8h selects the first color; after that the DAC
+;            takes R, G, B through 3C9h and moves on to the next color by
+;            itself, so the whole table is sent in a single loop.
+;            Setting a video mode reloads the default palette, so this
+;            runs after SetMode13h, and DOS gets its colors back on exit.
+;------------------------------------------------------------------------------
+SetPalette PROC
+    push ax
+    push cx
+    push dx
+    push si
+
+    mov  dx, DAC_WRITE
+    mov  al, PAL_FIRST
+    out  dx, al                 ; start writing at color 16
+
+    mov  dx, DAC_DATA
+    mov  si, OFFSET paletteTable
+    mov  cx, PAL_COUNT * 3      ; 3 bytes (R, G, B) per color
+    cld
+SPal_Next:
+    lodsb                       ; AL = next channel value
+    out  dx, al
+    loop SPal_Next
+
+    pop  si
+    pop  dx
+    pop  cx
+    pop  ax
+    ret
+SetPalette ENDP
 
 ;------------------------------------------------------------------------------
 ; RestoreVideoMode - put back whatever mode DOS had before the game
@@ -1120,7 +1211,7 @@ DrawBoard PROC
     mov  di, 20
     mov  al, BAR_COLOR
     call FillRect
-    DRAW_TEXT 8, 6, 14, txtTitle
+    DRAW_TEXT 8, 6, TITLE_COLOR, txtTitle
 
     mov  bl, levelIdx           ; level name comes from a table of
     xor  bh, bh                 ; string offsets, indexed by level
@@ -1128,7 +1219,7 @@ DrawBoard PROC
     mov  si, levelNameTable[bx]
     mov  bx, 200
     mov  dx, 6
-    mov  cl, 11
+    mov  cl, ACCENT_COLOR
     call DrawText
 
     ; ---- Zone B: frame and rows ----
@@ -1184,7 +1275,7 @@ DrawTryCounter PROC
     jne  TC_Show                ; game over: show the attempts really used
     inc  al                     ; the attempt being played now
 TC_Show:
-    mov  cl, 15
+    mov  cl, TEXT_COLOR
     call DrawNumber2
     mov  al, '/'
     mov  bx, 288
@@ -1222,7 +1313,7 @@ DrawPanel PROC
     mov  di, PANEL_H
     mov  al, FRAME_COLOR
     call DrawFrame
-    DRAW_TEXT 212, 28, 14, txtFichas
+    DRAW_TEXT 212, 28, TITLE_COLOR, txtFichas
 
     ; ---- Potion grid: PANEL_COLS per row, number below each ----
     xor  si, si                 ; SI = potion index 0..numColors-1
@@ -1256,7 +1347,7 @@ DP_Next:
     add  al, '0'                ; same number as a key hint below it
     add  bx, 4
     add  dx, 18
-    mov  cl, 15
+    mov  cl, TEXT_COLOR
     call DrawChar
 
     inc  si
@@ -1962,10 +2053,14 @@ MS_Done:
 SetManualSecret ENDP
 
 ;------------------------------------------------------------------------------
-; EndGame - show the result, reveal the secret, ask what to do next
-; Receives : gameState (WON or LOST), secretCode, numPos
+; EndGame - RF-11/RF-12: end screen, secret revealed, animated result
+; Receives : gameState (WON or LOST), secretCode, numPos, bulls, cows,
+;            triesUsed
 ; Returns  : AL = RESULT_AGAIN (ENTER), RESULT_MENU (M), RESULT_QUIT (ESC)
 ; Destroys : AH
+; Notes    : win and lose share the layout but not the animation:
+;            winning makes gold sparks jump and the title flash gold/green,
+;            losing makes grey smoke rise and the title blink dim red
 ;------------------------------------------------------------------------------
 EndGame PROC
     push bx
@@ -1974,28 +2069,21 @@ EndGame PROC
     push si
     push di
 
-    mov  animFlags, 0           ; the mascot area is about to be reused
-
-    ; Replace the mascot area of the panel with the result
-    mov  bx, PANEL_X + 2
-    mov  dx, 128
-    mov  si, PANEL_W - 4
-    mov  di, 60
+    mov  animFlags, 0           ; nothing moves while the screen is built
     mov  al, BG_COLOR
-    call FillRect
+    call ClearScreen
+    mov  si, OFFSET txtTitle
+    call DrawHeaderBar
 
-    cmp  gameState, STATE_WON
-    jne  EGm_Lost
-    DRAW_TEXT 212, 132, 14, txtWon
-    jmp  EGm_Secret
-EGm_Lost:
-    DRAW_TEXT 212, 132, 12, txtLost
-
-EGm_Secret:
-    DRAW_TEXT 212, 146, FRAME_COLOR, txtSecret
+    ; ---- The secret, centered: x0 = 162 - numPos*10 ----
+    DRAW_TEXT 104, 60, FRAME_COLOR, txtCodeLbl
+    mov  al, numPos
+    mov  bl, 10
+    mul  bl                     ; AX = numPos * 10
+    mov  bx, 162
+    sub  bx, ax                 ; BX = x of the first potion
+    mov  dx, 72
     xor  si, si                 ; SI = position of the secret
-    mov  bx, 212
-    mov  dx, 158
 EGm_Potion:
     mov  al, secretCode[si]
     call DrawPotion
@@ -2006,13 +2094,40 @@ EGm_Potion:
     cmp  si, ax
     jb   EGm_Potion
 
+    ; ---- Result of the last attempt ----
+    DRAW_SPRITE 136, 96, chispa_W, chispa_H, chispa
+    mov  al, bulls
+    add  al, '0'
+    mov  bx, 146
+    mov  dx, 96
+    mov  cl, TITLE_COLOR
+    call DrawChar
+    DRAW_SPRITE 166, 96, burbuja_W, burbuja_H, burbuja
+    mov  al, cows
+    add  al, '0'
+    mov  bx, 176
+    mov  cl, ACCENT_COLOR
+    call DrawChar
+
+    ; ---- Attempts used ----
+    DRAW_TEXT 84, 112, TEXT_COLOR, txtUsed
+    mov  al, triesUsed
+    mov  bx, 220
+    mov  dx, 112
+    mov  cl, TEXT_COLOR
+    call DrawNumber2
+
     mov  si, OFFSET txtEndHelp
     mov  cl, HELP_COLOR
     call ShowStatus
 
+    ; ---- Start the animation (title + both cauldrons) ----
+    mov  mascotFrame, 0
+    call DrawEndAnim
+    mov  animFlags, ANIM_END
+
 EGm_Wait:
-    mov  ah, 00h
-    int  16h
+    call WaitKeyAnimated        ; animation keeps running meanwhile
     cmp  al, KEY_ENTER
     je   EGm_Again
     cmp  al, KEY_ESC
@@ -2035,6 +2150,125 @@ EGm_Done:
     pop  bx
     ret
 EndGame ENDP
+
+;------------------------------------------------------------------------------
+; DrawEndAnim - draw the current frame of the end screen animation
+; Receives : gameState, mascotFrame
+; Returns  : nothing
+; Destroys : nothing
+; Notes    : wipes only the two small boxes around the cauldrons (RG-08);
+;            the title is redrawn in place with the other color, its
+;            pixels are exactly the same so nothing needs wiping there
+;------------------------------------------------------------------------------
+DrawEndAnim PROC
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    call WaitRetrace
+    mov  dx, END_CY - 24
+    mov  si, END_BOX_W
+    mov  di, END_BOX_H
+    mov  al, BG_COLOR
+    mov  bx, END_LEFT_X - 16
+    call FillRect
+    mov  bx, END_RIGHT_X - 16
+    call FillRect
+
+    mov  bx, END_LEFT_X
+    call DrawEndSide
+    mov  bx, END_RIGHT_X
+    call DrawEndSide
+
+    ; ---- Title: win flashes green/gold, lose blinks red/dim ----
+    cmp  gameState, STATE_WON
+    jne  DEA_Lost
+    mov  si, OFFSET txtWon
+    mov  cl, WIN_COLOR
+    cmp  mascotFrame, 0
+    je   DEA_Title
+    mov  cl, TITLE_COLOR
+    jmp  DEA_Title
+DEA_Lost:
+    mov  si, OFFSET txtLost
+    mov  cl, LOSE_COLOR
+    cmp  mascotFrame, 0
+    je   DEA_Title
+    mov  cl, FRAME_COLOR
+DEA_Title:
+    mov  bx, END_TITLE_X
+    mov  dx, END_TITLE_Y
+    call DrawText
+
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  bx
+    pop  ax
+    ret
+DrawEndAnim ENDP
+
+;------------------------------------------------------------------------------
+; DrawEndSide - one cauldron with its sparks (win) or smoke (lose)
+; Receives : BX = x of the cauldron, gameState, mascotFrame, endOffsets
+; Returns  : nothing
+; Destroys : nothing
+; Notes    : the 3 positions come from endOffsets, a table indexed by
+;            result and frame, so the animation is data, not code
+;------------------------------------------------------------------------------
+DrawEndSide PROC
+    push ax
+    push cx
+    push dx
+    push si
+    push di
+
+    mov  dx, END_CY
+    cmp  mascotFrame, 0
+    jne  DES_Frame2
+    DRAW_SPRITE bx, dx, caldero1_W, caldero1_H, caldero1
+    jmp  DES_Group
+DES_Frame2:
+    DRAW_SPRITE bx, dx, caldero2_W, caldero2_H, caldero2
+
+DES_Group:
+    xor  ax, ax                 ; group 0/1 = win, 2/3 = lose
+    cmp  gameState, STATE_WON
+    je   DES_AddFrame
+    mov  al, 2
+DES_AddFrame:
+    add  al, mascotFrame
+    mov  cl, 12                 ; 3 pairs of words per group
+    mul  cl
+    mov  si, ax                 ; SI = byte offset of the group
+
+    mov  cx, 3
+DES_Next:
+    mov  ax, endOffsets[si]     ; dx of this particle
+    add  ax, bx
+    mov  di, endOffsets[si+2]   ; dy of this particle
+    add  di, END_CY
+    cmp  gameState, STATE_WON
+    jne  DES_Smoke
+    DRAW_SPRITE ax, di, chispa_W, chispa_H, chispa
+    jmp  DES_Step
+DES_Smoke:
+    DRAW_SPRITE ax, di, burbuja_W, burbuja_H, burbuja
+DES_Step:
+    add  si, 4
+    loop DES_Next
+
+    pop  di
+    pop  si
+    pop  dx
+    pop  cx
+    pop  ax
+    ret
+DrawEndSide ENDP
 
 ;==============================================================================
 ;                         ANIMATION AND MENUS
@@ -2133,8 +2367,12 @@ WK_Loop:
     call DrawMascot
 WK_NoMascot:
     test animFlags, ANIM_CURSOR
-    jz   WK_Loop
+    jz   WK_NoCursor
     call DrawCursor
+WK_NoCursor:
+    test animFlags, ANIM_END
+    jz   WK_Loop
+    call DrawEndAnim
     jmp  WK_Loop
 
 WK_Key:
@@ -2170,7 +2408,7 @@ DrawHeaderBar PROC
 
     mov  bx, 8
     mov  dx, 6
-    mov  cl, 14
+    mov  cl, TITLE_COLOR
     call DrawText
 
     pop  di
@@ -2250,7 +2488,7 @@ DL_Bar:
     mov  cl, FRAME_COLOR
     cmp  ch, listSel
     jne  DL_Text
-    mov  cl, 14                 ; selected: yellow
+    mov  cl, TITLE_COLOR        ; selected: gold
 DL_Text:
     push si
     mov  bx, listX
@@ -2352,7 +2590,7 @@ TitleScreen PROC
     DRAW_TEXT  52, 108, 10, txtTagline
     DRAW_TEXT   0, 128, FRAME_COLOR, txtCourse
     DRAW_TEXT  76, 144, FRAME_COLOR, txtBy
-    DRAW_TEXT 116, 144, 15, txtAuthorName
+    DRAW_TEXT 116, 144, TEXT_COLOR, txtAuthorName
 
     mov  si, OFFSET txtPressKey
     mov  cl, HELP_COLOR
@@ -2438,7 +2676,7 @@ LevelScreen PROC
     DRAW_TEXT 8, 116, FRAME_COLOR, txtLvlInfo0
     DRAW_TEXT 8, 128, FRAME_COLOR, txtLvlInfo1
     DRAW_TEXT 8, 140, FRAME_COLOR, txtLvlInfo2
-    DRAW_TEXT 8, 156, 15, txtLvlInfo3
+    DRAW_TEXT 8, 156, TEXT_COLOR, txtLvlInfo3
     mov  si, OFFSET txtLevelHelp
     mov  cl, HELP_COLOR
     call ShowStatus
@@ -2479,9 +2717,9 @@ InstructionsScreen PROC
     mov  si, OFFSET txtHelpTitle
     call DrawHeaderBar
 
-    DRAW_TEXT 8, 26, 15, txtHelp1
-    DRAW_TEXT 8, 36, 15, txtHelp2
-    DRAW_TEXT 8, 46, 15, txtHelp3
+    DRAW_TEXT 8, 26, TEXT_COLOR, txtHelp1
+    DRAW_TEXT 8, 36, TEXT_COLOR, txtHelp2
+    DRAW_TEXT 8, 46, TEXT_COLOR, txtHelp3
 
     ; What each icon means, shown with the real icons
     DRAW_SPRITE 8, 62, chispa_W, chispa_H, chispa
@@ -2547,14 +2785,14 @@ CreditsScreen PROC
     mov  si, OFFSET txtCreditsTitle
     call DrawHeaderBar
 
-    DRAW_TEXT  76,  40, 14, txtTitle
+    DRAW_TEXT  76,  40, TITLE_COLOR, txtTitle
     DRAW_TEXT  40,  60, FRAME_COLOR, txtAuthorLbl
-    DRAW_TEXT  96,  60, 15, txtAuthorName
+    DRAW_TEXT  96,  60, TEXT_COLOR, txtAuthorName
     DRAW_TEXT  20,  84, FRAME_COLOR, txtCred1
     DRAW_TEXT  24,  96, FRAME_COLOR, txtCred2
     DRAW_TEXT 108, 108, FRAME_COLOR, txtCred3
     DRAW_TEXT  40, 128, FRAME_COLOR, txtCred4
-    DRAW_TEXT  56, 140, 15, txtCred6
+    DRAW_TEXT  56, 140, TEXT_COLOR, txtCred6
     DRAW_TEXT  36, 170, 10, txtCred7
 
     mov  si, OFFSET txtBackKey
